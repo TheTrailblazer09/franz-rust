@@ -5,7 +5,6 @@ A Kafka-compatible event streaming broker, written in Rust.
 Real Kafka clients — `kcat`, `librdkafka`, the Java client — can produce to it
 and consume from it without knowing it isn't Kafka.
 
-**Status:** just started. Nothing works yet.
 
 ## Why wire compatibility
 
