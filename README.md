@@ -5,43 +5,58 @@ A Kafka-compatible event streaming broker, written in Rust.
 Real Kafka clients — `kcat`, `librdkafka`, the Java client — can produce to it
 and consume from it without knowing it isn't Kafka.
 
-## Why build another Kafka
+## What I think is missing from Kafka
 
-Not to replace it. Kafka is excellent, this is not a competitor, and nobody
-should run this in production.
+Kafka documents what its durability settings promise. It cannot tell you what
+they cost.
 
-I build and operate a system where a wrong write is a data-correctness
-incident. I designed its action log and rollback path — every bulk operation
-records who did it, when, and what happened to each item, so it can be
-reversed — and I am also the person who gets paged when something there goes
-sideways. Zero-downtime migrations on live tables, health checks, automated
-validation: the usual apparatus for being able to say *we did not lose
-anything*.
+`acks`, `min.insync.replicas`, `log.flush.interval.messages`,
+`log.flush.interval.ms` — each is specified as a guarantee, and the
+specification is right. What none of it answers is the question you have when
+something has already gone wrong: *if this setting is the wrong one, how much
+data do I lose, and how often?* Not the promise. The failure, measured.
 
-All of which rests on a durable log, and I could not tell you what one actually
-does when the disk stops cooperating. Not the guarantee — the guarantee is
-documented. What I could not say is **which property fails first when the
-guarantee is not met**, and how much data that costs. An `fsync` that returns
-before the bytes land. Power cut partway through a write, leaving half a record
-on disk. Those are the cases that matter at 3am, and they are the ones you
-cannot provoke.
+You cannot answer it by experiment either, because you cannot make Kafka's disk
+lie. There is no way to tell a broker that `fsync` returned while the bytes did
+not land, or to persist the first 300 bytes of a write and discard the rest, or
+to halt a recovery scan midway and ask what it now believes about its own log.
+Ordinary crash testing cannot reach those states: a `write` to a regular file
+is not interrupted partway through by a signal, so `SIGKILL` can lose a whole
+write but never tear one. Kafka's own tests do hand-craft a corrupt segment
+here and there, and that is worth doing — but hand-crafting is not searching.
+Nobody is exploring the space of partial persistence to find the state that
+breaks you, and as an operator you cannot explore it at all.
 
-You certainly cannot provoke them in Kafka. You cannot make its disk lie on
-demand, cannot ask it to persist the first 300 bytes of an unsynced write and
-drop the rest, cannot stop its recovery scan halfway and ask what it now
-believes about its own log. The only way in is to read the source and hope you
-understood it.
+So durability gets configured by folklore. Someone sets
+`flush.interval.messages` to a number that sounds careful, and nobody can say
+what that number bought.
 
-franz is small enough to instrument instead. Every byte it writes goes through
-one trait, so [the simulator](#the-crash-simulator) can replace the disk with
-one that loses and tears writes on command, reproducibly, from a 64-bit seed.
-That makes the question answerable by experiment: take each safety mechanism
-out, crash the thing a few thousand times, and measure what the mechanism was
-worth. [The results are below](#what-each-safety-mechanism-is-worth), including
-the ones where the answer is "nothing".
+## What I did about it
 
-The broker exists so that experiment can be run. The experiment is the point.
-That is also why it speaks the real protocol instead of one of its own.
+franz is a Kafka-compatible broker small enough to lie to. Every byte it writes
+passes through a single trait, so [the simulator](#the-crash-simulator) can
+swap the disk for one that loses unsynced data and persists arbitrary prefixes
+of what came after — reproducibly, from a 64-bit seed. Speaking the real
+protocol keeps it honest: unmodified `kcat` and `librdkafka` drive it, so the
+thing being measured behaves like a broker rather than like my idea of one.
+
+That turns the question into an experiment. Pin one setting, crash it two
+thousand times, and count the records the broker **acknowledged** and could not
+produce afterwards. [The results are here](#what-each-safety-mechanism-is-worth),
+and they do not match what the configuration surface implies:
+
+- Against a process dying, the fsync policy barely matters at all — every
+  setting loses at most one batch, because the page cache outlives the process.
+- Against power loss it matters enormously, but the curve has a knee: one step
+  away from `fsync` on every write recovers 76% of peak throughput while cutting
+  loss from 14.8% of acknowledged records to 5.0%.
+- Flushing every 64 batches is statistically indistinguishable from never
+  flushing. It is a setting that costs you something and returns nothing
+  measurable.
+
+None of that is a criticism of Kafka's engineering, and nobody should run franz
+in production. It is a criticism of what you can learn about a storage system
+you are not allowed to break.
 
 ## Why wire compatibility
 
