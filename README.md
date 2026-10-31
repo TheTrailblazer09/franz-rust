@@ -8,23 +8,40 @@ and consume from it without knowing it isn't Kafka.
 ## Why build another Kafka
 
 Not to replace it. Kafka is excellent, this is not a competitor, and nobody
-should run it in production.
+should run this in production.
 
-The reason is that Kafka is a black box exactly where you most want it open.
-You cannot make its disk lie to it on demand. You cannot ask it to persist the
-first 300 bytes of an unsynced write, drop the rest, and then tell you what it
-believes about its own log. You cannot stop its recovery scan halfway. Those
-are the behaviours that decide whether a log can be trusted, and they are
-precisely the ones you cannot observe from outside — so the usual way to learn
-them is to read the source and hope you understood it.
+I build and operate a system where a wrong write is a data-correctness
+incident. I designed its action log and rollback path — every bulk operation
+records who did it, when, and what happened to each item, so it can be
+reversed — and I am also the person who gets paged when something there goes
+sideways. Zero-downtime migrations on live tables, health checks, automated
+validation: the usual apparatus for being able to say *we did not lose
+anything*.
 
-franz is small enough to instrument instead. Every byte it writes passes
-through one trait, so [the simulator](#the-crash-simulator) can swap the disk
-for one that loses and tears writes on command, and then assert — from a 64-bit
-seed, reproducibly — that nothing acknowledged went missing. The broker exists
-so that experiment can be run; the experiment is the point.
+All of which rests on a durable log, and I could not tell you what one actually
+does when the disk stops cooperating. Not the guarantee — the guarantee is
+documented. What I could not say is **which property fails first when the
+guarantee is not met**, and how much data that costs. An `fsync` that returns
+before the bytes land. Power cut partway through a write, leaving half a record
+on disk. Those are the cases that matter at 3am, and they are the ones you
+cannot provoke.
 
-That is also why it speaks the real protocol rather than one of its own.
+You certainly cannot provoke them in Kafka. You cannot make its disk lie on
+demand, cannot ask it to persist the first 300 bytes of an unsynced write and
+drop the rest, cannot stop its recovery scan halfway and ask what it now
+believes about its own log. The only way in is to read the source and hope you
+understood it.
+
+franz is small enough to instrument instead. Every byte it writes goes through
+one trait, so [the simulator](#the-crash-simulator) can replace the disk with
+one that loses and tears writes on command, reproducibly, from a 64-bit seed.
+That makes the question answerable by experiment: take each safety mechanism
+out, crash the thing a few thousand times, and measure what the mechanism was
+worth. [The results are below](#what-each-safety-mechanism-is-worth), including
+the ones where the answer is "nothing".
+
+The broker exists so that experiment can be run. The experiment is the point.
+That is also why it speaks the real protocol instead of one of its own.
 
 ## Why wire compatibility
 
@@ -128,11 +145,12 @@ support here at all.
 
 ## Durability
 
-| `--fsync` | Behaviour | Survives |
+| Setting | Behaviour | Survives |
 | --- | --- | --- |
-| `always` | fsync before acknowledging | machine power loss |
-| `N` (ms) | fsync at most every N ms | power loss, minus up to N ms |
-| `never` | leave it to the page cache | process crash, not power loss |
+| `--fsync always` | fsync before acknowledging | machine power loss |
+| `--fsync N` | fsync at most every N ms | power loss, minus up to N ms |
+| `--fsync-messages N` | fsync every N batches | power loss, minus up to N batches |
+| `--fsync never` | leave it to the page cache | process crash, not power loss |
 
 All three survive `SIGKILL`, because the page cache outlives the process. Only
 `always` survives the machine losing power.
@@ -237,11 +255,15 @@ bytes, 99 MiB total, one partition, `kcat` over loopback.
 
 | `--fsync` | produce msg/s | produce MiB/s | consume msg/s | consume MiB/s |
 | --- | --- | --- | --- | --- |
-| `always` | 402,059 | 79.7 | 608,347 | 120.5 |
-| `100` | 825,355 | 163.5 | 582,547 | 115.4 |
-| `never` | 884,330 | 175.2 | 589,553 | 116.8 |
+| `always` | 396,983 | 78.7 | 427,022 | 84.6 |
+| `--fsync-messages 4` | 681,663 | 135.1 | 424,376 | 84.1 |
+| `--fsync-messages 16` | 827,404 | 164.0 | 420,203 | 83.3 |
+| `--fsync-messages 64` | 888,415 | 176.0 | 425,062 | 84.2 |
+| `100` (ms) | 838,926 | 166.2 | 424,484 | 84.1 |
+| `never` | 898,473 | 178.0 | 422,833 | 83.8 |
 
-Reproduce with `scripts/bench.sh`.
+Reproduce with `scripts/bench.sh`. Those are throughput only; what each setting
+*costs* is [measured separately](#what-each-safety-mechanism-is-worth).
 
 The interesting part is how small the fsync penalty is: 2.2x, not the 50x the
 design notes guessed at. The reason is that `librdkafka` batches hard — tens of
@@ -261,6 +283,83 @@ rather than by how much data is on disk:
 
 The second row holds 103 MiB across two segments and scans only the 39 MiB
 active one. Cost is dominated by re-checksumming it.
+
+## What each safety mechanism is worth
+
+The point of being able to crash the broker on demand is that durability stops
+being an argument and becomes a measurement. `sim --ablate` pins one setting at
+a time, crashes 2,000 seeded runs, and counts the records the broker had
+**acknowledged** and could not produce afterwards.
+
+Throughput is from `scripts/bench.sh` on the same machine; loss is from
+`cargo run --release --bin sim -- --ablate --seeds 2000`.
+
+### Power lost mid-write
+
+| Setting | produce msg/s | of peak | runs losing data | records lost p50 | p99 | worst | share of acked lost |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `--fsync always` | 396,983 | 44% | **0%** | 0 | 0 | 0 | **0.00%** |
+| `--fsync-messages 4` | 681,663 | 76% | 73% | 4 | 16 | 23 | 4.97% |
+| `--fsync-messages 16` | 827,404 | 92% | 88% | 8 | 50 | 63 | 12.05% |
+| `--fsync-messages 64` | 888,415 | 99% | 90% | 8 | 76 | 106 | 14.78% |
+| `--fsync never` | 898,473 | 100% | 90% | 8 | 78 | 106 | 14.79% |
+
+### Process killed
+
+| Setting | runs losing data | records lost p99 | worst | share of acked lost |
+| --- | --- | --- | --- | --- |
+| `--fsync always` | 0% | 0 | 0 | 0.00% |
+| `--fsync-messages 4` | 19% | 8 | 8 | 0.90% |
+| `--fsync-messages 16` | 22% | 8 | 8 | 1.03% |
+| `--fsync-messages 64` | 23% | 8 | 8 | 1.08% |
+| `--fsync never` | 23% | 8 | 8 | 1.08% |
+
+### What the tables say
+
+**Against a process dying, the fsync policy barely matters.** Every setting
+loses at most one batch, and `never` loses 1.08% against `always`'s zero. The
+page cache outlives the process, so the only records at risk are the ones in an
+append the broker had not finished issuing. The failure most people actually
+experience — a crash, an OOM kill, a rough deploy — is the one the policy is
+nearly irrelevant to.
+
+**Against power loss it matters enormously, but the curve flattens fast.**
+`always` costs 56% of peak throughput and loses nothing. One step away from it,
+`--fsync-messages 4` recovers 76% of peak throughput while cutting loss from
+14.8% of acknowledged records to 5.0%. That is the knee.
+
+**And the last two rows are a negative result.** `--fsync-messages 64` and
+`never` are indistinguishable: 90% of runs lose data either way, p99 of 76
+against 78 records, 14.78% against 14.79%. Past some interval the policy stops
+buying anything, and syncing every 64 batches is a setting that costs you
+complexity and returns nothing. The honest recommendation from this table is
+`always` if the data matters, `--fsync-messages 4` if throughput does, and
+nothing in between.
+
+### Removing the recovery machinery entirely
+
+The same instrument, pointed at the code rather than the configuration.
+`scripts/mutation_test.sh` deletes one safety mechanism at a time:
+
+| Removed | Caught by seed | How it fails |
+| --- | --- | --- |
+| checksum validation during recovery | 1 | reads run off the end of the file — a torn batch is accepted as real |
+| truncating the torn tail | 1 | synced data reported lost, then an unreadable log |
+| rebuilding the index after truncation | 1 | offsets become unreachable, index points past the data |
+
+None survives a single seed, and each message names the actual defect rather
+than a generic mismatch. That is what makes the clean runs above mean something
+instead of nothing.
+
+### What this cannot measure
+
+**Time-based `--fsync N` is invisible to the simulator.** A simulated run
+finishes in microseconds, so no wall-clock interval ever elapses and every
+timer behaves exactly like `never`. That is why the tables use the count-based
+policy, which is Kafka's `log.flush.interval.messages` and needs no clock.
+Measuring the timer honestly would need a simulated clock threaded through the
+log — the same trick as the storage seam, applied to time. It is the obvious
+next thing to build.
 
 ## Crash safety
 
@@ -382,6 +481,7 @@ and each message points at the actual defect rather than at a generic mismatch.
 ```
 cargo test                 # 61 unit tests
 cargo run --bin sim        # deterministic crash simulator
+cargo run --bin sim -- --ablate   # what each durability setting costs
 scripts/mutation_test.sh   # checks the simulator can actually fail
 scripts/crash_test.sh      # SIGKILL loop against the real broker
 scripts/group_test.sh      # two real consumers sharing a topic

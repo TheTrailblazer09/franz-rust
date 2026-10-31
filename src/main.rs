@@ -145,6 +145,7 @@ usage: franz [options]
   --host HOST               address to listen on and advertise (default 127.0.0.1)
   --port PORT               default 9092
   --fsync always|never|MS   durability policy (default never)
+  --fsync-messages N        fsync every N batches instead of on a timer
   --segment-bytes N         roll a segment past this size (default 64 MiB)
   --index-interval N        one index entry per N bytes of log (default 4096)
   --offsets-partitions N    partitions in __consumer_offsets (default 8)
@@ -184,6 +185,9 @@ fn parse_args() -> Result<Settings, String> {
                     "never" => franz::log::Sync::Never,
                     ms => franz::log::Sync::Interval(Duration::from_millis(parse(ms, "fsync")?)),
                 };
+            }
+            "--fsync-messages" => {
+                cfg.sync = franz::log::Sync::EveryN(parse(&value()?, "fsync-messages")?)
             }
             "--offsets-partitions" => offsets_partitions = parse(&value()?, "offsets-partitions")?,
             "--node-id" => node_id = parse(&value()?, "node-id")?,
@@ -247,6 +251,9 @@ fn describe_sync(sync: franz::log::Sync) -> String {
     match sync {
         franz::log::Sync::Always => "every write (survives power loss)".to_string(),
         franz::log::Sync::Never => "never (survives a process crash, not power loss)".to_string(),
+        franz::log::Sync::EveryN(n) => {
+            format!("every {n} batches (loses up to that many on power loss)")
+        }
         franz::log::Sync::Interval(every) => {
             format!(
                 "every {}ms (loses up to that on power loss)",

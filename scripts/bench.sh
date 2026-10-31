@@ -37,9 +37,24 @@ mibs() {
 }
 now() { python3 -c 'import time;print(time.time())'; }
 
-for policy in always 100 never; do
+# Label, then the flag pair. Count-based settings are here so the throughput
+# numbers line up with the loss numbers from `sim --ablate`, which cannot
+# measure a time-based policy at all.
+POLICIES=(
+  "always|--fsync always"
+  "every 4 batches|--fsync-messages 4"
+  "every 16 batches|--fsync-messages 16"
+  "every 64 batches|--fsync-messages 64"
+  "every 100ms|--fsync 100"
+  "never|--fsync never"
+)
+
+for entry in "${POLICIES[@]}"; do
+  label=${entry%%|*}
+  flags=${entry#*|}
   rm -rf "$WORK/data"
-  "$BROKER" --topic bench:1 --data-dir "$WORK/data" --port "$PORT" --fsync "$policy" \
+  # shellcheck disable=SC2086
+  "$BROKER" --topic bench:1 --data-dir "$WORK/data" --port "$PORT" $flags \
     > "$WORK/broker.log" 2>&1 &
   pid=$!
   for _ in $(seq 1 200); do nc -z 127.0.0.1 "$PORT" 2>/dev/null && break; sleep 0.05; done
@@ -58,7 +73,6 @@ for policy in always 100 never; do
 
   p=$(elapsed "$t0" "$t1")
   c=$(elapsed "$t2" "$t3")
-  label=$([ "$policy" = "100" ] && echo "every 100ms" || echo "$policy")
   printf '| %s | %s | %s | %s | %s |\n' \
     "$label" "$(rate "$MESSAGES" "$p")" "$(mibs "$bytes" "$p")" \
     "$(rate "$MESSAGES" "$c")" "$(mibs "$bytes" "$c")"

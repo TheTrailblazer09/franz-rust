@@ -7,7 +7,7 @@
 //! Every run is a seed, so a failure is a seed, and a seed reproduces exactly.
 
 use franz::log::Sync;
-use franz::sim::{self, Crash};
+use franz::sim::{self, Crash, Knobs};
 
 const USAGE: &str = "\
 usage: sim [options]
@@ -15,6 +15,7 @@ usage: sim [options]
   --from N      first seed (default 1)
   --seed N      run one seed and describe it
   --cycles N    crash and recover this many times per seed (default 3)
+  --ablate      measure what each durability setting costs, instead of hunting
   --verbose     print every run, not just failures";
 
 fn main() {
@@ -23,6 +24,7 @@ fn main() {
     let mut one: Option<u64> = None;
     let mut cycles: u32 = 3;
     let mut verbose = false;
+    let mut ablate = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -35,6 +37,7 @@ fn main() {
             "--from" => from = number(&value()),
             "--seed" => one = Some(number(&value())),
             "--cycles" => cycles = number(&value()) as u32,
+            "--ablate" => ablate = true,
             "--verbose" => verbose = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
@@ -42,6 +45,11 @@ fn main() {
             }
             other => fail(&format!("unknown argument `{other}`")),
         }
+    }
+
+    if ablate {
+        ablation(from, seeds);
+        return;
     }
 
     if let Some(seed) = one {
@@ -137,4 +145,125 @@ fn fail(message: &str) -> ! {
     eprintln!("sim: {message}");
     eprintln!("{USAGE}");
     std::process::exit(2);
+}
+
+// --- the ablation ----------------------------------------------------------
+
+/// What one durability setting cost, over many seeds.
+struct Cost {
+    runs: u32,
+    losing: u32,
+    torn: u32,
+    lost: Vec<i64>,
+    acknowledged: i64,
+}
+
+impl Cost {
+    fn new() -> Self {
+        Cost {
+            runs: 0,
+            losing: 0,
+            torn: 0,
+            lost: Vec::new(),
+            acknowledged: 0,
+        }
+    }
+
+    fn add(&mut self, outcome: &sim::Outcome) {
+        let lost = (outcome.acknowledged - outcome.recovered).max(0);
+        self.runs += 1;
+        self.acknowledged += outcome.acknowledged;
+        if lost > 0 {
+            self.losing += 1;
+        }
+        if outcome.truncated_bytes > 0 {
+            self.torn += 1;
+        }
+        self.lost.push(lost);
+    }
+
+    fn at(&mut self, quantile: f64) -> i64 {
+        if self.lost.is_empty() {
+            return 0;
+        }
+        self.lost.sort_unstable();
+        let index = ((self.lost.len() - 1) as f64 * quantile).round() as usize;
+        self.lost[index]
+    }
+
+    /// Share of all acknowledged records that did not survive.
+    fn loss_rate(&self) -> f64 {
+        if self.acknowledged == 0 {
+            return 0.0;
+        }
+        self.lost.iter().sum::<i64>() as f64 / self.acknowledged as f64 * 100.0
+    }
+}
+
+/// Each durability setting against each crash mode, measured rather than
+/// argued about.
+///
+/// One crash cycle per seed, so "lost" is a number you can read: the records
+/// the broker had acknowledged and could not produce afterwards.
+fn ablation(from: u64, seeds: u64) {
+    // Count-based rather than time-based on purpose. The simulator has no
+    // clock, so a run finishes in microseconds and every time-based interval
+    // behaves exactly like `never`. That is itself worth knowing, and it is
+    // written up in the README rather than papered over here.
+    let settings: [(&str, Sync); 5] = [
+        ("always", Sync::Always),
+        ("every 4 batches", Sync::EveryN(4)),
+        ("every 16 batches", Sync::EveryN(16)),
+        ("every 64 batches", Sync::EveryN(64)),
+        ("never", Sync::Never),
+    ];
+
+    for (mode, label) in [
+        (Crash::ProcessKill, "process killed (page cache survives)"),
+        (Crash::PowerLoss, "power lost (only synced bytes survive)"),
+    ] {
+        println!();
+        println!("{label}, {seeds} seeds each");
+        println!(
+            "| --fsync | runs losing data | records lost p50 | p99 | worst | of all acked | torn tail |"
+        );
+        println!("| --- | --- | --- | --- | --- | --- | --- |");
+
+        for (name, sync) in settings {
+            let mut cost = Cost::new();
+            let mut violations = 0;
+
+            for seed in from..from + seeds {
+                let knobs = Knobs {
+                    sync: Some(sync),
+                    crash: Some(mode),
+                    cycles: 1,
+                };
+                match sim::run_with(seed, knobs) {
+                    Ok(outcome) => cost.add(&outcome),
+                    Err(_) => violations += 1,
+                }
+            }
+
+            let note = if violations > 0 {
+                format!(" ({violations} VIOLATIONS)")
+            } else {
+                String::new()
+            };
+            println!(
+                "| `{}` | {:.0}% | {} | {} | {} | {:.2}% | {:.0}%{} |",
+                name,
+                cost.losing as f64 / cost.runs.max(1) as f64 * 100.0,
+                cost.at(0.50),
+                cost.at(0.99),
+                cost.at(1.0),
+                cost.loss_rate(),
+                cost.torn as f64 / cost.runs.max(1) as f64 * 100.0,
+                note,
+            );
+        }
+    }
+
+    println!();
+    println!("A torn tail is a partial record batch left on disk for recovery to truncate.");
 }

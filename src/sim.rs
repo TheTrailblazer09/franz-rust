@@ -270,6 +270,18 @@ pub struct Violation {
     pub what: String,
 }
 
+/// Knobs the caller can pin instead of letting the seed choose them.
+///
+/// Leaving them unset is the right thing for hunting bugs: the seed picks, so
+/// a few thousand runs cover combinations nobody thought to try. Pinning them
+/// is for measuring, where the question is what one specific setting costs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Knobs {
+    pub sync: Option<Sync>,
+    pub crash: Option<Crash>,
+    pub cycles: u32,
+}
+
 /// One seed: a few rounds of appending, crashing and recovering.
 ///
 /// Repeating the cycle is where it earns its keep. A single crash only tests
@@ -280,18 +292,33 @@ pub fn run(seed: u64) -> Result<Outcome, Violation> {
 }
 
 pub fn run_cycles(seed: u64, cycles: u32) -> Result<Outcome, Violation> {
-    let mut rng = Rng::new(seed);
+    run_with(
+        seed,
+        Knobs {
+            cycles,
+            ..Knobs::default()
+        },
+    )
+}
 
-    let sync = match rng.below(3) {
+pub fn run_with(seed: u64, knobs: Knobs) -> Result<Outcome, Violation> {
+    let mut rng = Rng::new(seed);
+    let cycles = if knobs.cycles == 0 { 3 } else { knobs.cycles };
+
+    // Drawn from the rng even when pinned, so a seed means the same sequence
+    // of appends either way and two configurations stay comparable.
+    let drawn_sync = match rng.below(3) {
         0 => Sync::Always,
         1 => Sync::Never,
         _ => Sync::Interval(std::time::Duration::from_millis(rng.below(20))),
     };
-    let crash = if rng.chance(50) {
+    let drawn_crash = if rng.chance(50) {
         Crash::PowerLoss
     } else {
         Crash::ProcessKill
     };
+    let sync = knobs.sync.unwrap_or(drawn_sync);
+    let crash = knobs.crash.unwrap_or(drawn_crash);
     let cfg = Config {
         // Small, so segments roll often and recovery has to pick the right one.
         segment_bytes: 400 + rng.below(4000),
@@ -506,6 +533,7 @@ pub fn describe(sync: Sync) -> &'static str {
     match sync {
         Sync::Always => "always",
         Sync::Never => "never",
+        Sync::EveryN(_) => "every-n",
         Sync::Interval(_) => "interval",
     }
 }

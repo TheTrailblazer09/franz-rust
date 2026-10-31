@@ -38,6 +38,10 @@ pub enum Sync {
     Always,
     /// fsync at most this often. Loses up to one interval on power loss.
     Interval(Duration),
+    /// fsync every N appends, Kafka's `log.flush.interval.messages`. Unlike
+    /// the time-based policy this is measurable without a clock, which is why
+    /// the ablation uses it.
+    EveryN(u32),
     /// Leave it to the page cache. Survives a process crash, not power loss.
     Never,
 }
@@ -153,6 +157,7 @@ pub struct Log {
     segments: Vec<Segment>,
     next_offset: i64,
     last_sync: Instant,
+    appends_since_sync: u32,
     dirty: bool,
 }
 
@@ -214,6 +219,7 @@ impl Log {
             segments,
             next_offset: 0,
             last_sync: Instant::now(),
+            appends_since_sync: 0,
             dirty: false,
         };
 
@@ -316,6 +322,7 @@ impl Log {
 
         self.next_offset = offset;
         self.dirty = true;
+        self.appends_since_sync += 1;
         self.sync_if_needed()?;
 
         Ok(first_offset)
@@ -368,6 +375,7 @@ impl Log {
 
         self.next_offset = expected;
         self.dirty = true;
+        self.appends_since_sync += 1;
         self.sync_if_needed()?;
 
         Ok(first)
@@ -393,6 +401,7 @@ impl Log {
         let due = match self.cfg.sync {
             Sync::Always => true,
             Sync::Interval(every) => self.last_sync.elapsed() >= every,
+            Sync::EveryN(n) => self.appends_since_sync >= n.max(1),
             Sync::Never => false,
         };
         if due {
@@ -409,6 +418,7 @@ impl Log {
         active.log.sync()?;
         active.index.sync()?;
         self.last_sync = Instant::now();
+        self.appends_since_sync = 0;
         self.dirty = false;
         Ok(())
     }
