@@ -14,7 +14,7 @@ they cost.
 `log.flush.interval.ms` — each is specified as a guarantee, and the
 specification is right. What none of it answers is the question you have when
 something has already gone wrong: *if this setting is the wrong one, how much
-data do I lose, and how often?* Not the promise. The failure, measured.
+data do I lose, and how often?* 
 
 You cannot answer it by experiment either, because you cannot make Kafka's disk
 lie. There is no way to tell a broker that `fsync` returned while the bytes did
