@@ -1,18 +1,16 @@
 //! franz: a broker that speaks the Apache Kafka wire protocol.
-//!
 //! Step 1 reads messages off the wire and prints them. Nothing is answered
 //! yet. The point is to establish the one rule everything later depends on:
 //! every Kafka message is a 4-byte big-endian length followed by exactly that
 //! many bytes. Read the length, read exactly that many bytes, then parse.
 //!
-//! Getting that wrong is worth understanding before writing any more. A short
-//! read treated as a whole message does not fail here — it fails on the *next*
-//! message, because the bytes left over are read as that message's length
-//! prefix. From then on the connection is garbage and the error points
-//! nowhere near the mistake.
+
+mod protocol;
 
 use std::io::{ErrorKind, Read};
 use std::net::{TcpListener, TcpStream};
+
+use crate::protocol::{Reader, RequestHeader};
 
 const LISTEN: &str = "127.0.0.1:9092";
 
@@ -34,8 +32,7 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Reads frames until the client goes away. One connection at a time, which is
-/// all step 1 needs.
+/// Reads frames until the client goes away.
 fn serve(mut client: TcpStream) -> std::io::Result<()> {
     loop {
         let mut prefix = [0u8; 4];
@@ -52,6 +49,23 @@ fn serve(mut client: TcpStream) -> std::io::Result<()> {
 
         println!("\nframe of {len} bytes:");
         hexdump(&frame);
+        describe(&frame);
+    }
+}
+
+/// Says what the client asked for, without acting on it.
+fn describe(frame: &[u8]) {
+    let mut r = Reader::new(frame);
+    match RequestHeader::decode(&mut r) {
+        Ok(h) => println!(
+            "  {} v{} from {}, correlation_id {}, {} bytes of body",
+            h.api_key.name(),
+            h.api_version,
+            h.client_id.as_deref().unwrap_or("(no client_id)"),
+            h.correlation_id,
+            r.remaining(),
+        ),
+        Err(e) => println!("  unparseable: {e}"),
     }
 }
 
