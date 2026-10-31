@@ -18,13 +18,13 @@
 //! position, and scans batch headers forward; the scan is bounded by the index
 //! interval rather than by the size of the log.
 
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::batch;
+use crate::files::{Blocks, Files, OnDisk};
 
 /// Filenames are the base offset, zero-padded, so lexical order is numeric.
 const NAME_WIDTH: usize = 20;
@@ -61,8 +61,8 @@ impl Default for Config {
 
 struct Segment {
     base_offset: i64,
-    log: File,
-    index: File,
+    log: Box<dyn Blocks>,
+    index: Box<dyn Blocks>,
     /// Bytes written to the log file.
     size: u64,
     /// Bytes appended since the last index entry.
@@ -71,19 +71,11 @@ struct Segment {
 }
 
 impl Segment {
-    fn open(dir: &Path, base_offset: i64) -> io::Result<Self> {
-        let log = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(dir.join(format!("{base_offset:0NAME_WIDTH$}.log")))?;
-        let index = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(dir.join(format!("{base_offset:0NAME_WIDTH$}.index")))?;
+    fn open(files: &dyn Files, dir: &Path, base_offset: i64) -> io::Result<Self> {
+        let log = files.open(&dir.join(format!("{base_offset:0NAME_WIDTH$}.log")))?;
+        let index = files.open(&dir.join(format!("{base_offset:0NAME_WIDTH$}.index")))?;
 
-        let size = log.metadata()?.len();
+        let size = log.size()?;
         Ok(Segment {
             base_offset,
             log,
@@ -95,9 +87,7 @@ impl Segment {
     }
 
     fn load_index(&mut self) -> io::Result<()> {
-        let mut bytes = Vec::new();
-        self.index.seek(SeekFrom::Start(0))?;
-        self.index.read_to_end(&mut bytes)?;
+        let bytes = self.index.read_all()?;
 
         self.entries = bytes
             .as_chunks::<INDEX_ENTRY>()
@@ -116,8 +106,8 @@ impl Segment {
         let relative = (offset - self.base_offset) as u32;
         let position = position as u32;
 
-        self.index.write_all(&relative.to_be_bytes())?;
-        self.index.write_all(&position.to_be_bytes())?;
+        self.index.append(&relative.to_be_bytes())?;
+        self.index.append(&position.to_be_bytes())?;
         self.entries.push((relative, position));
         self.since_index = 0;
         Ok(())
@@ -137,8 +127,7 @@ impl Segment {
 
     /// Rebuilds the index from the log, used after recovery truncates it.
     fn rebuild_index(&mut self, batches: &[(i64, u64)], interval: u64) -> io::Result<()> {
-        self.index.set_len(0)?;
-        self.index.seek(SeekFrom::End(0))?;
+        self.index.truncate(0)?;
         self.entries.clear();
         self.since_index = 0;
 
@@ -153,11 +142,12 @@ impl Segment {
                 last_indexed = Some(*position);
             }
         }
-        self.index.sync_all()
+        self.index.sync()
     }
 }
 
 pub struct Log {
+    files: Arc<dyn Files>,
     dir: PathBuf,
     cfg: Config,
     segments: Vec<Segment>,
@@ -177,12 +167,21 @@ pub struct Recovery {
 
 impl Log {
     pub fn open(dir: impl Into<PathBuf>, cfg: Config) -> io::Result<(Self, Recovery)> {
+        Log::open_with(dir, cfg, Arc::new(OnDisk))
+    }
+
+    /// Opens a log over any storage, which is how the simulator drives this
+    /// code with a disk that can lose and tear writes.
+    pub fn open_with(
+        dir: impl Into<PathBuf>,
+        cfg: Config,
+        files: Arc<dyn Files>,
+    ) -> io::Result<(Self, Recovery)> {
         let dir = dir.into();
-        std::fs::create_dir_all(&dir)?;
+        files.create_dir_all(&dir)?;
 
         let mut bases = Vec::new();
-        for entry in std::fs::read_dir(&dir)? {
-            let path = entry?.path();
+        for path in files.list(&dir)? {
             if path.extension().is_some_and(|e| e == "log") {
                 let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 match stem.parse::<i64>() {
@@ -203,12 +202,13 @@ impl Log {
 
         let mut segments = Vec::new();
         for base in &bases {
-            let mut segment = Segment::open(&dir, *base)?;
+            let mut segment = Segment::open(&*files, &dir, *base)?;
             segment.load_index()?;
             segments.push(segment);
         }
 
         let mut log = Log {
+            files,
             dir,
             cfg,
             segments,
@@ -236,9 +236,7 @@ impl Log {
         let interval = self.cfg.index_interval_bytes;
         let active = self.segments.last_mut().expect("at least one segment");
 
-        let mut bytes = Vec::with_capacity(active.size as usize);
-        active.log.seek(SeekFrom::Start(0))?;
-        active.log.read_to_end(&mut bytes)?;
+        let bytes = active.log.read_all()?;
 
         let mut batches = Vec::new();
         let mut at = 0usize;
@@ -259,9 +257,8 @@ impl Log {
 
         let truncated_bytes = bytes.len() as u64 - at as u64;
         if truncated_bytes > 0 {
-            active.log.set_len(at as u64)?;
-            active.log.seek(SeekFrom::End(0))?;
-            active.log.sync_all()?;
+            active.log.truncate(at as u64)?;
+            active.log.sync()?;
             active.size = at as u64;
         }
 
@@ -307,7 +304,7 @@ impl Log {
 
         let active = self.segments.last_mut().expect("at least one segment");
         let start = active.size;
-        active.log.write_all(blob)?;
+        active.log.append(blob)?;
         active.size += blob.len() as u64;
         active.since_index += blob.len() as u64;
 
@@ -332,10 +329,10 @@ impl Log {
             return Ok(());
         }
 
-        active.log.sync_all()?;
-        active.index.sync_all()?;
+        active.log.sync()?;
+        active.index.sync()?;
 
-        let segment = Segment::open(&self.dir, self.next_offset)?;
+        let segment = Segment::open(&*self.files, &self.dir, self.next_offset)?;
         self.segments.push(segment);
         Ok(())
     }
@@ -356,9 +353,9 @@ impl Log {
         if !self.dirty {
             return Ok(());
         }
-        let active = self.segments.last().expect("at least one segment");
-        active.log.sync_all()?;
-        active.index.sync_all()?;
+        let active = self.segments.last_mut().expect("at least one segment");
+        active.log.sync()?;
+        active.index.sync()?;
         self.last_sync = Instant::now();
         self.dirty = false;
         Ok(())
@@ -386,7 +383,7 @@ impl Log {
         let mut header = [0u8; batch::HEADER_LEN];
 
         while at < segment.size {
-            if segment.log.read_exact_at(&mut header, at).is_err() {
+            if segment.log.read_at(&mut header, at).is_err() {
                 break;
             }
             let parsed = match batch::parse_header(&header) {
@@ -412,7 +409,7 @@ impl Log {
                     break;
                 }
                 let mut whole = vec![0u8; parsed.total_len];
-                segment.log.read_exact_at(&mut whole, at)?;
+                segment.log.read_at(&mut whole, at)?;
                 out.extend_from_slice(&whole);
                 if out.len() >= max_bytes {
                     break;
@@ -608,7 +605,8 @@ mod tests {
         let partial = batch(0, 4);
         let half = &partial[..partial.len() / 2];
         {
-            let mut file = OpenOptions::new()
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
                 .append(true)
                 .open(dir.0.join(format!("{:020}.log", 0)))
                 .unwrap();

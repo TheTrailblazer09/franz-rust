@@ -458,6 +458,12 @@ impl Coordinator {
     }
 }
 
+impl Default for Coordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The protocol every member supports. Clients send a preference list; the
 /// first one they all share wins.
 fn common_protocol(group: &Group) -> Option<String> {

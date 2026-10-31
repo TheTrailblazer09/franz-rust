@@ -1,31 +1,17 @@
 //! franz: a broker that speaks the Apache Kafka wire protocol.
 
-mod api_versions;
-mod batch;
-mod broker;
-mod crc32c;
-mod fetch;
-mod group;
-mod group_api;
-mod list_offsets;
-mod log;
-mod metadata;
-mod produce;
-mod protocol;
-mod topics;
-
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::broker::Broker;
-use crate::group::Coordinator;
-use crate::group_api::OFFSETS_TOPIC;
-use crate::metadata::BrokerInfo;
-use crate::protocol::{ApiKey, Reader, RequestHeader, Writer, codes, write_response_header};
-use crate::topics::Topics;
+use franz::broker::Broker;
+use franz::group::Coordinator;
+use franz::group_api::OFFSETS_TOPIC;
+use franz::metadata::BrokerInfo;
+use franz::protocol::{ApiKey, Reader, RequestHeader, Writer, codes, write_response_header};
+use franz::topics::Topics;
 
 const NODE_ID: i32 = 1;
 const CLUSTER_ID: &str = "franz-dev";
@@ -40,7 +26,7 @@ struct Settings {
     data_dir: PathBuf,
     verbose: bool,
     topics: Topics,
-    log: log::Config,
+    log: franz::log::Config,
 }
 
 /// What to do with a request once it has been handled.
@@ -84,7 +70,7 @@ fn main() -> std::io::Result<()> {
     println!("franz listening on {listen}");
 
     let coordinator = Arc::new(Coordinator::new());
-    match group_api::load_offsets(&broker, &coordinator) {
+    match franz::group_api::load_offsets(&broker, &coordinator) {
         Ok(0) => {}
         Ok(n) => println!("replayed {n} committed offsets from {OFFSETS_TOPIC}"),
         Err(e) => println!("could not replay {OFFSETS_TOPIC}: {e}"),
@@ -165,7 +151,7 @@ fn parse_args() -> Result<Settings, String> {
     let mut port: u16 = 9092;
     let mut data_dir = PathBuf::from("data");
     let mut verbose = false;
-    let mut cfg = log::Config::default();
+    let mut cfg = franz::log::Config::default();
     let mut offsets_partitions: i32 = 8;
 
     let mut args = std::env::args().skip(1);
@@ -181,9 +167,9 @@ fn parse_args() -> Result<Settings, String> {
             "--fsync" => {
                 let raw = value()?;
                 cfg.sync = match raw.as_str() {
-                    "always" => log::Sync::Always,
-                    "never" => log::Sync::Never,
-                    ms => log::Sync::Interval(Duration::from_millis(parse(ms, "fsync")?)),
+                    "always" => franz::log::Sync::Always,
+                    "never" => franz::log::Sync::Never,
+                    ms => franz::log::Sync::Interval(Duration::from_millis(parse(ms, "fsync")?)),
                 };
             }
             "--offsets-partitions" => offsets_partitions = parse(&value()?, "offsets-partitions")?,
@@ -213,11 +199,11 @@ fn parse<T: std::str::FromStr>(raw: &str, what: &str) -> Result<T, String> {
         .map_err(|_| format!("`{raw}` is not a valid {what}"))
 }
 
-fn describe_sync(sync: log::Sync) -> String {
+fn describe_sync(sync: franz::log::Sync) -> String {
     match sync {
-        log::Sync::Always => "every write (survives power loss)".to_string(),
-        log::Sync::Never => "never (survives a process crash, not power loss)".to_string(),
-        log::Sync::Interval(every) => {
+        franz::log::Sync::Always => "every write (survives power loss)".to_string(),
+        franz::log::Sync::Never => "never (survives a process crash, not power loss)".to_string(),
+        franz::log::Sync::Interval(every) => {
             format!(
                 "every {}ms (loses up to that on power loss)",
                 every.as_millis()
@@ -329,13 +315,16 @@ fn respond(
     let version = header.api_version;
 
     match header.api_key {
-        ApiKey::ApiVersions if unsupported => api_versions::write_unsupported(&mut w),
-        ApiKey::ApiVersions => {
-            api_versions::write_response(&mut w, version, codes::NONE, &api_versions::advertised())
-        }
+        ApiKey::ApiVersions if unsupported => franz::api_versions::write_unsupported(&mut w),
+        ApiKey::ApiVersions => franz::api_versions::write_response(
+            &mut w,
+            version,
+            codes::NONE,
+            &franz::api_versions::advertised(),
+        ),
 
         ApiKey::Metadata => {
-            let request = match metadata::Request::decode(&mut r, version) {
+            let request = match franz::metadata::Request::decode(&mut r, version) {
                 Ok(request) => request,
                 Err(e) => return bad_body("Metadata", e),
             };
@@ -345,7 +334,7 @@ fn respond(
                 port: info.port,
                 cluster_id: CLUSTER_ID,
             };
-            metadata::write_response(
+            franz::metadata::write_response(
                 &mut w,
                 version,
                 &broker_info,
@@ -355,45 +344,45 @@ fn respond(
         }
 
         ApiKey::Produce => {
-            let mut request = match produce::Request::decode(&mut r, version) {
+            let mut request = match franz::produce::Request::decode(&mut r, version) {
                 Ok(request) => request,
                 Err(e) => return bad_body("Produce", e),
             };
             if verbose {
                 println!(
                     "  {} records, acks={}",
-                    produce::record_count(&request),
+                    franz::produce::record_count(&request),
                     request.acks
                 );
             }
             let acks = request.acks;
-            let results = produce::apply(broker, &mut request);
+            let results = franz::produce::apply(broker, &mut request);
             if acks == 0 {
                 return Reply::Silent;
             }
-            produce::write_response(&mut w, version, &results);
+            franz::produce::write_response(&mut w, version, &results);
         }
 
         ApiKey::Fetch => {
-            let request = match fetch::Request::decode(&mut r, version) {
+            let request = match franz::fetch::Request::decode(&mut r, version) {
                 Ok(request) => request,
                 Err(e) => return bad_body("Fetch", e),
             };
-            let results = fetch::apply(broker, &request);
-            fetch::write_response(&mut w, version, &results);
+            let results = franz::fetch::apply(broker, &request);
+            franz::fetch::write_response(&mut w, version, &results);
         }
 
         ApiKey::ListOffsets => {
-            let request = match list_offsets::Request::decode(&mut r, version) {
+            let request = match franz::list_offsets::Request::decode(&mut r, version) {
                 Ok(request) => request,
                 Err(e) => return bad_body("ListOffsets", e),
             };
-            let results = list_offsets::apply(broker, &request);
-            list_offsets::write_response(&mut w, version, &results);
+            let results = franz::list_offsets::apply(broker, &request);
+            franz::list_offsets::write_response(&mut w, version, &results);
         }
 
         ApiKey::FindCoordinator => {
-            let outcome = group_api::find_coordinator(
+            let outcome = franz::group_api::find_coordinator(
                 &mut r, &mut w, version, NODE_ID, &info.host, info.port,
             );
             if let Err(e) = outcome {
@@ -401,32 +390,34 @@ fn respond(
             }
         }
         ApiKey::JoinGroup => {
-            if let Err(e) = group_api::join_group(&mut r, &mut w, version, coordinator) {
+            if let Err(e) = franz::group_api::join_group(&mut r, &mut w, version, coordinator) {
                 return bad_body("JoinGroup", e);
             }
         }
         ApiKey::SyncGroup => {
-            if let Err(e) = group_api::sync_group(&mut r, &mut w, version, coordinator) {
+            if let Err(e) = franz::group_api::sync_group(&mut r, &mut w, version, coordinator) {
                 return bad_body("SyncGroup", e);
             }
         }
         ApiKey::Heartbeat => {
-            if let Err(e) = group_api::heartbeat(&mut r, &mut w, version, coordinator) {
+            if let Err(e) = franz::group_api::heartbeat(&mut r, &mut w, version, coordinator) {
                 return bad_body("Heartbeat", e);
             }
         }
         ApiKey::LeaveGroup => {
-            if let Err(e) = group_api::leave_group(&mut r, &mut w, version, coordinator) {
+            if let Err(e) = franz::group_api::leave_group(&mut r, &mut w, version, coordinator) {
                 return bad_body("LeaveGroup", e);
             }
         }
         ApiKey::OffsetCommit => {
-            if let Err(e) = group_api::offset_commit(&mut r, &mut w, version, broker, coordinator) {
+            if let Err(e) =
+                franz::group_api::offset_commit(&mut r, &mut w, version, broker, coordinator)
+            {
                 return bad_body("OffsetCommit", e);
             }
         }
         ApiKey::OffsetFetch => {
-            if let Err(e) = group_api::offset_fetch(&mut r, &mut w, version, coordinator) {
+            if let Err(e) = franz::group_api::offset_fetch(&mut r, &mut w, version, coordinator) {
                 return bad_body("OffsetFetch", e);
             }
         }
@@ -435,7 +426,7 @@ fn respond(
     Reply::Send(w.into_inner())
 }
 
-fn bad_body(api: &str, e: protocol::Error) -> Reply {
+fn bad_body(api: &str, e: franz::protocol::Error) -> Reply {
     println!("  bad {api} body: {e}");
     Reply::Close
 }

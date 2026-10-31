@@ -296,8 +296,7 @@ fn i64(bytes: &[u8], at: usize) -> i64 {
     i64::from_be_bytes(bytes[at..at + 8].try_into().expect("eight bytes"))
 }
 
-#[cfg(test)]
-pub(crate) mod fixtures {
+pub mod fixtures {
     use super::*;
 
     /// Builds a valid batch with `count` zero-length records.
@@ -306,7 +305,7 @@ pub(crate) mod fixtures {
         for i in 0..count {
             // length, attributes, timestamp_delta, offset_delta, key, value, headers
             let body = [0u8, 0, (i as u8) << 1, 0xff, 0xff, 0];
-            records.push(((body.len() as u8) << 1) as u8); // zigzag length
+            records.push((body.len() as u8) << 1); // zigzag length
             records.extend_from_slice(&body);
         }
 

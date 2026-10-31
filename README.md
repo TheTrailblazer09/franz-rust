@@ -174,18 +174,100 @@ Passes the same way with `fsync=always`.
 Worth being precise about what this does and does not prove. `SIGKILL` does not
 reliably produce a torn batch, because a `write` to a regular file is not
 interrupted partway through by a signal — the bytes are in the page cache or
-they are not. So these rounds exercise offset continuity and clean restart, and
-the torn-tail path is exercised directly by a unit test that writes half a batch
-to a log file and reopens it. Genuinely proving the torn case end to end needs
-power loss or a fault-injection layer that fails a write partway.
+they are not. So these rounds exercise offset continuity and clean restart, but
+not the failure that actually threatens a commit log.
+
+That is what the simulator below is for.
+
+## The crash simulator
+
+`SIGKILL` cannot tear a write. A `write` to a regular file is not interrupted
+partway through by a signal, so the bytes reach the page cache or they do not —
+which means the scariest failure for a log, *half a record batch on disk and no
+record of how it got there*, is unreachable from a real crash test without
+pulling the power cord.
+
+So every byte the log reads or writes goes through a trait, and the simulator
+supplies an implementation that lies the way hardware does. It models the two
+crash modes separately, because they are not the same thing:
+
+| | What survives | Can it tear a batch? |
+| --- | --- | --- |
+| Process killed | everything written — the page cache outlives the process | only an append still being issued |
+| Power lost | everything synced, plus an arbitrary prefix of what came after | yes, and this is where torn batches come from |
+
+Each run is a 64-bit seed that picks the fsync policy, the segment size, the
+index interval, the crash mode, how many batches get appended, and where the
+crash lands. Then it crashes, recovers, appends more, and crashes again — three
+cycles per seed, because a single crash only tests recovery against a log a
+healthy broker wrote, while the second tests it against a log that recovery
+itself produced.
+
+After every recovery it asserts:
+
+- the log is a **contiguous prefix** of what was acknowledged: no gap, no
+  reordering, no offset that reads back as a different record
+- every batch passes its CRC-32C
+- nothing that was synced is missing, and with `fsync=always` nothing
+  acknowledged is missing at all
+- data that survived one crash survives the next
+- **every** offset in the log is reachable through the sparse index — a stale
+  index entry left pointing past a truncation shows up here and nowhere else
+
+```
+$ cargo run --release --bin sim -- --seeds 2000
+running seeds 1..2001 with 3 crash cycle(s) each
+
+2000 seeds, 3 crash(es) each
+  960 power-loss runs, 1040 process-kill runs
+  982 runs had a partial batch on disk for recovery to truncate
+  686 runs lost tail records that were never synced
+
+no violations
+```
+
+A failure prints the seed, and the seed reproduces it exactly:
+
+```
+cargo run --release --bin sim -- --seed 1337
+```
+
+### Testing the test
+
+A crash harness that has never failed proves nothing. It might be asserting
+something that cannot be violated, or quietly asserting nothing at all. So
+`scripts/mutation_test.sh` breaks recovery on purpose, three ways, and insists
+the simulator notices each one:
+
+```
+$ scripts/mutation_test.sh
+injecting bugs into recovery and checking the simulator notices
+
+  1. recovery skips checksum validation     caught at seed 1
+      cycle 2: read at 0 failed: read 117 bytes at 1808 of a 1898-byte file
+  2. torn tail is left on disk              caught at seed 1
+      cycle 1: lost synced data, recovered 29 but synced through 64
+  3. stale index kept after truncation      caught at seed 1
+      cycle 1: read at 0 returned nothing, log ends at 76
+
+  unmutated code                            no violations
+
+the simulator catches every injected bug and passes clean code
+```
+
+Each mutation is applied to a copy, built, run, and reverted; nothing
+deliberately broken is left in the tree. All three are caught by the first seed,
+and each message points at the actual defect rather than at a generic mismatch.
 
 ## Testing
 
 ```
-cargo test              # 44 unit tests
-scripts/crash_test.sh   # SIGKILL loop
-scripts/group_test.sh   # two real consumers sharing a topic
-scripts/bench.sh        # throughput table above
+cargo test                 # 49 unit tests
+cargo run --bin sim        # deterministic crash simulator
+scripts/mutation_test.sh   # checks the simulator can actually fail
+scripts/crash_test.sh      # SIGKILL loop against the real broker
+scripts/group_test.sh      # two real consumers sharing a topic
+scripts/bench.sh           # throughput table above
 ```
 
 The tests worth looking at are the ones using bytes captured from a real

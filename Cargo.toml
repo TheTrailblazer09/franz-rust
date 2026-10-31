@@ -3,4 +3,12 @@ name = "franz"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "franz"
+path = "src/lib.rs"
+
+[[bin]]
+name = "franz"
+path = "src/main.rs"
+
 [dependencies]
