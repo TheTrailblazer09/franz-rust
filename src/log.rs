@@ -321,6 +321,58 @@ impl Log {
         Ok(first_offset)
     }
 
+    /// Appends bytes that already carry offsets, as a follower copying from
+    /// its leader does.
+    ///
+    /// The offsets are the leader's and must not be rewritten: the two logs
+    /// are supposed to be byte-identical, and a follower that renumbers has
+    /// quietly diverged. A base offset that does not continue this log is a
+    /// gap, and refusing it is the only honest answer without leader epochs to
+    /// work out where the logs split.
+    pub fn append_replicated(&mut self, blob: &mut [u8]) -> Result<i64, AppendError> {
+        let batches = batch::parse_all(blob).map_err(AppendError::Batch)?;
+        if batches.is_empty() {
+            return Ok(self.next_offset);
+        }
+
+        let first = batches[0].base_offset;
+        if first != self.next_offset {
+            return Err(AppendError::Divergent {
+                expected: self.next_offset,
+                found: first,
+            });
+        }
+
+        let mut expected = first;
+        for parsed in &batches {
+            if parsed.base_offset != expected {
+                return Err(AppendError::Divergent {
+                    expected,
+                    found: parsed.base_offset,
+                });
+            }
+            expected += parsed.offsets();
+        }
+
+        self.roll_if_needed(blob.len() as u64)?;
+
+        let active = self.segments.last_mut().expect("at least one segment");
+        let start = active.size;
+        active.log.append(blob)?;
+        active.size += blob.len() as u64;
+        active.since_index += blob.len() as u64;
+
+        if active.since_index >= self.cfg.index_interval_bytes {
+            active.add_index_entry(first, start)?;
+        }
+
+        self.next_offset = expected;
+        self.dirty = true;
+        self.sync_if_needed()?;
+
+        Ok(first)
+    }
+
     /// A batch is never split across segments. If the incoming bytes do not
     /// fit, the segment is sealed first and they go whole into the next one.
     fn roll_if_needed(&mut self, incoming: u64) -> io::Result<()> {
@@ -426,6 +478,11 @@ impl Log {
 pub enum AppendError {
     Batch(batch::Error),
     Io(io::Error),
+    /// Replicated bytes do not continue this log.
+    Divergent {
+        expected: i64,
+        found: i64,
+    },
 }
 
 impl From<io::Error> for AppendError {
@@ -441,6 +498,10 @@ impl std::fmt::Display for AppendError {
         match self {
             AppendError::Batch(e) => write!(f, "{e}"),
             AppendError::Io(e) => write!(f, "{e}"),
+            AppendError::Divergent { expected, found } => write!(
+                f,
+                "replicated batch starts at {found} but this log ends at {expected}"
+            ),
         }
     }
 }

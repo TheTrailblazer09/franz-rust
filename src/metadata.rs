@@ -72,12 +72,21 @@ impl Request {
     }
 }
 
+/// How a partition is laid out across the cluster.
+pub struct Placement {
+    pub leader: i32,
+    pub replicas: Vec<i32>,
+    pub in_sync: Vec<i32>,
+}
+
 pub fn write_response(
     w: &mut Writer,
     version: i16,
     broker: &BrokerInfo,
+    brokers: &[BrokerInfo],
     topics: &Topics,
     wanted: Option<&[String]>,
+    placement: &dyn Fn(&str, i32) -> Placement,
 ) {
     let flexible = KEY.is_flexible(version);
 
@@ -85,20 +94,21 @@ pub fn write_response(
         w.i32(0); // throttle_time_ms
     }
 
-    // One broker, which is us.
-    array_len(w, flexible, 1);
-    w.i32(broker.node_id);
-    if flexible {
-        w.compact_string(broker.host);
-    } else {
-        w.string(broker.host);
-    }
-    w.i32(broker.port);
-    if version >= 1 {
-        write_nullable_string(w, flexible, None); // rack
-    }
-    if flexible {
-        w.empty_tagged_fields();
+    array_len(w, flexible, brokers.len());
+    for node in brokers {
+        w.i32(node.node_id);
+        if flexible {
+            w.compact_string(node.host);
+        } else {
+            w.string(node.host);
+        }
+        w.i32(node.port);
+        if version >= 1 {
+            write_nullable_string(w, flexible, None); // rack
+        }
+        if flexible {
+            w.empty_tagged_fields();
+        }
     }
 
     if version >= 2 {
@@ -141,19 +151,35 @@ pub fn write_response(
         let partitions = topic.map_or(0, |t| t.partitions);
         array_len(w, flexible, partitions as usize);
         for index in 0..partitions {
+            let placed = placement(name, index);
+
             w.i16(codes::NONE);
             w.i32(index);
-            w.i32(broker.node_id); // leader
+            w.i32(placed.leader);
             if version >= 7 {
+                // Leadership never moves without a controller, so the epoch
+                // this broker reports never changes.
                 w.i32(0); // leader_epoch
             }
-            // Single node, so it is the only replica and the whole ISR.
-            array_len(w, flexible, 1);
-            w.i32(broker.node_id);
-            array_len(w, flexible, 1);
-            w.i32(broker.node_id);
+            array_len(w, flexible, placed.replicas.len());
+            for id in &placed.replicas {
+                w.i32(*id);
+            }
+            array_len(w, flexible, placed.in_sync.len());
+            for id in &placed.in_sync {
+                w.i32(*id);
+            }
             if version >= 5 {
-                array_len(w, flexible, 0); // offline_replicas
+                let offline: Vec<i32> = placed
+                    .replicas
+                    .iter()
+                    .filter(|id| !placed.in_sync.contains(id))
+                    .copied()
+                    .collect();
+                array_len(w, flexible, offline.len());
+                for id in &offline {
+                    w.i32(*id);
+                }
             }
             if flexible {
                 w.empty_tagged_fields();
@@ -211,7 +237,21 @@ mod tests {
 
     fn encode(version: i16, wanted: Option<&[String]>) -> Vec<u8> {
         let mut w = Writer::new();
-        write_response(&mut w, version, &broker(), &topics(), wanted);
+        let me = broker();
+        let placement = |_: &str, _: i32| Placement {
+            leader: 1,
+            replicas: vec![1],
+            in_sync: vec![1],
+        };
+        write_response(
+            &mut w,
+            version,
+            &me,
+            std::slice::from_ref(&me),
+            &topics(),
+            wanted,
+            &placement,
+        );
         w.into_inner()
     }
 

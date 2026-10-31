@@ -38,6 +38,10 @@ loudly instead of silently producing into a new topic.
 --host HOST               address to listen on and advertise (default 127.0.0.1)
 --port PORT               default 9092
 --fsync always|never|MS   durability policy (default never)
+--node-id N               this broker's id (default 1)
+--peer ID@HOST:PORT       a broker in the cluster, repeatable, include self
+--replication-factor N    replicas per partition (default 1)
+--min-insync N            acks=all fails below this many in-sync replicas
 --segment-bytes N         roll a segment past this size (default 64 MiB)
 --index-interval N        one index entry per N bytes of log (default 4096)
 --verbose                 print every frame, with a hexdump
@@ -111,6 +115,99 @@ support here at all.
 
 All three survive `SIGKILL`, because the page cache outlives the process. Only
 `always` survives the machine losing power.
+
+## Replication
+
+```
+franz --node-id 1 --port 9091 --data-dir ./n1 --topic demo:6 \
+  --replication-factor 2 --min-insync 2 \
+  --peer 1@127.0.0.1:9091 --peer 2@127.0.0.1:9092 --peer 3@127.0.0.1:9093
+```
+
+Each partition has one leader and the rest followers. Clients read and write
+only to the leader; followers replicate by issuing ordinary `Fetch` requests
+against it with `replica_id` set to their node id instead of -1.
+
+That reuse is the point. Replication inherits the long-polling, the sparse
+index and the batch handling the consumer path already had, and the leader
+learns each follower's position from fetch offsets it was receiving anyway — a
+follower asking for offset N is telling you it holds everything below N.
+
+**Who holds what is a pure function of the config.** Every broker gets the same
+peer list and replication factor and computes the same assignment, so there is
+no controller and no consensus on metadata. The cost of that is stated below.
+
+**The high watermark is the lowest in-sync replica's position**, and it is the
+highest offset a consumer may read. A record above it exists on the leader but
+is not yet on enough replicas to be safe; a consumer allowed to read it could
+watch a record it had already seen disappear, which breaks the only promise a
+log makes. `acks=all` waits for the high watermark to reach the offset just
+written; `acks=1` returns after the leader's local append.
+
+**A follower that stops fetching leaves the in-sync set**, which *advances* the
+high watermark rather than stalling it — one slow replica must not be able to
+freeze a partition for everybody. With `--min-insync 2`, a produce at
+`acks=all` then fails with `NOT_ENOUGH_REPLICAS` instead of accepting a write
+only one node would hold.
+
+Replicated bytes keep the leader's offsets rather than being renumbered. The
+two logs are meant to be byte-identical, so a follower that restamps has
+quietly diverged; a batch that does not continue the follower's log is refused
+outright.
+
+`scripts/cluster_test.sh` runs three brokers on one machine:
+
+```
+three brokers up, demo:6 with replication factor 2
+
+metadata names a real leader per partition
+  ok    all three brokers advertised
+  ok    leadership spread over 3 brokers
+  ok    every partition has 2 replicas
+
+a write for a partition this broker does not lead still lands
+  ok    record reached the partition led by another broker
+
+acks=all round-trips through the followers
+  ok    all 1801 records readable
+
+followers hold the same bytes as their leader
+  ok    every partition with data is byte-identical on 2 nodes
+  ok    all 6 partitions carried data
+
+a dead follower leaves the ISR instead of freezing the partition
+  node 3 follows partition 1, led by broker 2
+        partition 1, leader 2, replicas: 2,3, isrs: 2
+  ok    partition 1 now reports a single-replica ISR
+  ok    acks=all refused while the ISR is below min-insync
+  ok    acks=1 still accepted on the degraded partition
+```
+
+### What static configuration costs
+
+Three limitations follow from having no controller, and they are the honest
+price of the design rather than things left for later:
+
+**No failover.** A leader named by config stays the leader. If that broker is
+down, its partitions are unavailable for reads and writes — the surviving
+replica has the data but will not serve it. Electing a new leader needs someone
+to decide, and deciding needs consensus on who decided.
+
+**Only a leader knows its ISR.** Nothing propagates in-sync state between
+brokers, so asking broker 1 about a partition led by broker 2 gets the
+configured replica set, not the live one. Real Kafka routes this through the
+controller.
+
+**No leader epochs, so no epoch-based truncation.** Leadership never moves, so
+the epoch this broker reports is always 0. This is the piece failover would
+need first: without epochs, a follower that was briefly leader can hold records
+the new leader never saw, and truncating to the high watermark either keeps
+divergent data or discards committed data. Knowing *that* is most of the value
+of the problem; the implementation only matters once leadership can move.
+
+Replacing the static config with Raft over the metadata log — brokers, topics,
+leadership — is the upgrade path. Data replication would stay leader-follower;
+only metadata needs consensus. Knowing which half needs it is the insight.
 
 ## Numbers
 
@@ -262,11 +359,12 @@ and each message points at the actual defect rather than at a generic mismatch.
 ## Testing
 
 ```
-cargo test                 # 49 unit tests
+cargo test                 # 61 unit tests
 cargo run --bin sim        # deterministic crash simulator
 scripts/mutation_test.sh   # checks the simulator can actually fail
 scripts/crash_test.sh      # SIGKILL loop against the real broker
 scripts/group_test.sh      # two real consumers sharing a topic
+scripts/cluster_test.sh    # three brokers, replication factor 2
 scripts/bench.sh           # throughput table above
 ```
 
@@ -280,7 +378,6 @@ are wrong.
 
 | Not implemented | Why |
 | --- | --- |
-| Replication | Single node. Every partition reports itself as leader and sole ISR |
 | Transactions, exactly-once | Needs a transaction coordinator and producer fencing |
 | Log compaction | A second storage engine with its own index |
 | Retention | Nothing is ever deleted; segments accumulate |
@@ -299,7 +396,7 @@ Two known rough edges, stated rather than hidden:
 
 
 - [x] Consumer groups
-- [ ] Replication across brokers
+- [x] Replication across brokers
 
 ## Consumer groups
 

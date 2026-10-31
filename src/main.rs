@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use franz::broker::Broker;
+use franz::cluster::{self, Cluster, Node};
 use franz::group::Coordinator;
 use franz::group_api::OFFSETS_TOPIC;
 use franz::metadata::BrokerInfo;
@@ -27,6 +28,7 @@ struct Settings {
     verbose: bool,
     topics: Topics,
     log: franz::log::Config,
+    cluster: Cluster,
 }
 
 /// What to do with a request once it has been handled.
@@ -60,6 +62,7 @@ fn main() -> std::io::Result<()> {
     let opened = Instant::now();
     let broker = Arc::new(Broker::open(
         settings.topics,
+        settings.cluster,
         &settings.data_dir,
         settings.log,
     )?);
@@ -68,6 +71,8 @@ fn main() -> std::io::Result<()> {
     let listen = format!("{}:{}", settings.host, settings.port);
     let listener = TcpListener::bind(&listen)?;
     println!("franz listening on {listen}");
+
+    franz::replica::start(Arc::clone(&broker));
 
     let coordinator = Arc::new(Coordinator::new());
     match franz::group_api::load_offsets(&broker, &coordinator) {
@@ -143,6 +148,10 @@ usage: franz [options]
   --segment-bytes N         roll a segment past this size (default 64 MiB)
   --index-interval N        one index entry per N bytes of log (default 4096)
   --offsets-partitions N    partitions in __consumer_offsets (default 8)
+  --node-id N               this broker's id (default 1)
+  --peer ID@HOST:PORT       a broker in the cluster, repeatable, include self
+  --replication-factor N    replicas per partition (default 1)
+  --min-insync N            acks=all fails below this many in-sync replicas
   --verbose                 print every frame";
 
 fn parse_args() -> Result<Settings, String> {
@@ -153,6 +162,10 @@ fn parse_args() -> Result<Settings, String> {
     let mut verbose = false;
     let mut cfg = franz::log::Config::default();
     let mut offsets_partitions: i32 = 8;
+    let mut node_id: i32 = 1;
+    let mut peers: Vec<Node> = Vec::new();
+    let mut replication_factor: usize = 1;
+    let mut min_insync: usize = 1;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -173,6 +186,10 @@ fn parse_args() -> Result<Settings, String> {
                 };
             }
             "--offsets-partitions" => offsets_partitions = parse(&value()?, "offsets-partitions")?,
+            "--node-id" => node_id = parse(&value()?, "node-id")?,
+            "--peer" => peers.push(cluster::parse_peer(&value()?)?),
+            "--replication-factor" => replication_factor = parse(&value()?, "replication-factor")?,
+            "--min-insync" => min_insync = parse(&value()?, "min-insync")?,
             "--verbose" => verbose = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
@@ -184,6 +201,32 @@ fn parse_args() -> Result<Settings, String> {
 
     specs.push(format!("{OFFSETS_TOPIC}:{offsets_partitions}"));
 
+    // With no --peer this is a one-node cluster that leads everything, which
+    // is what every single-broker run has been so far.
+    let cluster = if peers.is_empty() {
+        Cluster::alone(node_id, &host, port as i32)
+    } else {
+        if !peers.iter().any(|n| n.id == node_id) {
+            return Err(format!(
+                "--node-id {node_id} is not in the --peer list; every broker must list itself"
+            ));
+        }
+        if replication_factor == 0 {
+            return Err("--replication-factor must be at least 1".to_string());
+        }
+        if min_insync > replication_factor.min(peers.len()) {
+            return Err(format!(
+                "--min-insync {min_insync} cannot exceed the replication factor"
+            ));
+        }
+        Cluster {
+            me: node_id,
+            nodes: peers,
+            replication_factor,
+            min_insync,
+        }
+    };
+
     Ok(Settings {
         host,
         port,
@@ -191,6 +234,7 @@ fn parse_args() -> Result<Settings, String> {
         verbose,
         topics: Topics::from_specs(&specs)?,
         log: cfg,
+        cluster,
     })
 }
 
@@ -328,18 +372,53 @@ fn respond(
                 Ok(request) => request,
                 Err(e) => return bad_body("Metadata", e),
             };
-            let broker_info = BrokerInfo {
-                node_id: NODE_ID,
+            let me = BrokerInfo {
+                node_id: broker.cluster.me,
                 host: &info.host,
                 port: info.port,
                 cluster_id: CLUSTER_ID,
             };
+            // Every broker in the cluster, since the client reconnects to
+            // whichever one leads the partition it wants.
+            let peers: Vec<BrokerInfo> = broker
+                .cluster
+                .nodes
+                .iter()
+                .map(|node| BrokerInfo {
+                    node_id: node.id,
+                    host: &node.host,
+                    port: node.port,
+                    cluster_id: CLUSTER_ID,
+                })
+                .collect();
+
+            let placement = |topic: &str, index: i32| {
+                let replicas = broker.cluster.replicas(topic, index);
+                let leader = broker.cluster.leader(topic, index).unwrap_or(-1);
+                let in_sync = match broker.partition(topic, index) {
+                    Some(held) => match &held.replication {
+                        Some(state) => state.lock().expect("replication mutex").in_sync(),
+                        // Not the leader, so this broker does not know the ISR
+                        // and reports the replica set it was configured with.
+                        None => replicas.clone(),
+                    },
+                    None => replicas.clone(),
+                };
+                franz::metadata::Placement {
+                    leader,
+                    replicas,
+                    in_sync,
+                }
+            };
+
             franz::metadata::write_response(
                 &mut w,
                 version,
-                &broker_info,
+                &me,
+                &peers,
                 &broker.topics,
                 request.topics.as_deref(),
+                &placement,
             );
         }
 

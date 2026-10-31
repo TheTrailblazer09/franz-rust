@@ -7,6 +7,7 @@
 pub mod api_versions;
 pub mod batch;
 pub mod broker;
+pub mod cluster;
 pub mod crc32c;
 pub mod fetch;
 pub mod files;
@@ -17,5 +18,7 @@ pub mod log;
 pub mod metadata;
 pub mod produce;
 pub mod protocol;
+pub mod replica;
+pub mod replication;
 pub mod sim;
 pub mod topics;

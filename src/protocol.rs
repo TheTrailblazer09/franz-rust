@@ -68,6 +68,9 @@ pub mod codes {
     pub const OFFSET_OUT_OF_RANGE: i16 = 1;
     pub const CORRUPT_MESSAGE: i16 = 2;
     pub const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+    pub const NOT_LEADER_OR_FOLLOWER: i16 = 6;
+    pub const REQUEST_TIMED_OUT: i16 = 7;
+    pub const NOT_ENOUGH_REPLICAS: i16 = 19;
     pub const ILLEGAL_GENERATION: i16 = 22;
     pub const INCONSISTENT_GROUP_PROTOCOL: i16 = 23;
     pub const INVALID_GROUP_ID: i16 = 24;
