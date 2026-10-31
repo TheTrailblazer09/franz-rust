@@ -5,6 +5,8 @@ mod batch;
 mod broker;
 mod crc32c;
 mod fetch;
+mod group;
+mod group_api;
 mod list_offsets;
 mod log;
 mod metadata;
@@ -19,6 +21,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::broker::Broker;
+use crate::group::Coordinator;
+use crate::group_api::OFFSETS_TOPIC;
 use crate::metadata::BrokerInfo;
 use crate::protocol::{ApiKey, Reader, RequestHeader, Writer, codes, write_response_header};
 use crate::topics::Topics;
@@ -79,6 +83,25 @@ fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(&listen)?;
     println!("franz listening on {listen}");
 
+    let coordinator = Arc::new(Coordinator::new());
+    match group_api::load_offsets(&broker, &coordinator) {
+        Ok(0) => {}
+        Ok(n) => println!("replayed {n} committed offsets from {OFFSETS_TOPIC}"),
+        Err(e) => println!("could not replay {OFFSETS_TOPIC}: {e}"),
+    }
+
+    // Members that stop heartbeating have to be evicted, or their partitions
+    // stay assigned to a consumer that is gone.
+    let reaper = Arc::clone(&coordinator);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            for group in reaper.expire_members() {
+                println!("group {group}: a member timed out, rebalancing");
+            }
+        }
+    });
+
     let info = Arc::new(BrokerInfoOwned {
         host: settings.host,
         port: settings.port as i32,
@@ -89,6 +112,7 @@ fn main() -> std::io::Result<()> {
         let client = client?;
         let broker = Arc::clone(&broker);
         let info = Arc::clone(&info);
+        let coordinator = Arc::clone(&coordinator);
 
         // A thread each, rather than one connection at a time. Clients keep
         // several connections open at once and expect all of them served.
@@ -104,7 +128,7 @@ fn main() -> std::io::Result<()> {
             if verbose {
                 println!("\n{peer} connected");
             }
-            match serve(client, &broker, &info, verbose) {
+            match serve(client, &broker, &coordinator, &info, verbose) {
                 Ok(()) => {
                     if verbose {
                         println!("{peer} disconnected");
@@ -132,6 +156,7 @@ usage: franz [options]
   --fsync always|never|MS   durability policy (default never)
   --segment-bytes N         roll a segment past this size (default 64 MiB)
   --index-interval N        one index entry per N bytes of log (default 4096)
+  --offsets-partitions N    partitions in __consumer_offsets (default 8)
   --verbose                 print every frame";
 
 fn parse_args() -> Result<Settings, String> {
@@ -141,6 +166,7 @@ fn parse_args() -> Result<Settings, String> {
     let mut data_dir = PathBuf::from("data");
     let mut verbose = false;
     let mut cfg = log::Config::default();
+    let mut offsets_partitions: i32 = 8;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -160,6 +186,7 @@ fn parse_args() -> Result<Settings, String> {
                     ms => log::Sync::Interval(Duration::from_millis(parse(ms, "fsync")?)),
                 };
             }
+            "--offsets-partitions" => offsets_partitions = parse(&value()?, "offsets-partitions")?,
             "--verbose" => verbose = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
@@ -168,6 +195,8 @@ fn parse_args() -> Result<Settings, String> {
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
+
+    specs.push(format!("{OFFSETS_TOPIC}:{offsets_partitions}"));
 
     Ok(Settings {
         host,
@@ -202,6 +231,7 @@ fn describe_sync(sync: log::Sync) -> String {
 fn serve(
     mut client: TcpStream,
     broker: &Broker,
+    coordinator: &Coordinator,
     info: &BrokerInfoOwned,
     verbose: bool,
 ) -> std::io::Result<()> {
@@ -233,7 +263,7 @@ fn serve(
             hexdump(&frame);
         }
 
-        match respond(&frame, broker, info, verbose) {
+        match respond(&frame, broker, coordinator, info, verbose) {
             Reply::Send(body) => {
                 if verbose {
                     println!("  replying with {} bytes", body.len());
@@ -253,7 +283,13 @@ fn serve(
     }
 }
 
-fn respond(frame: &[u8], broker: &Broker, info: &BrokerInfoOwned, verbose: bool) -> Reply {
+fn respond(
+    frame: &[u8],
+    broker: &Broker,
+    coordinator: &Coordinator,
+    info: &BrokerInfoOwned,
+    verbose: bool,
+) -> Reply {
     let mut r = Reader::new(frame);
     let header = match RequestHeader::decode(&mut r) {
         Ok(header) => header,
@@ -354,6 +390,45 @@ fn respond(frame: &[u8], broker: &Broker, info: &BrokerInfoOwned, verbose: bool)
             };
             let results = list_offsets::apply(broker, &request);
             list_offsets::write_response(&mut w, version, &results);
+        }
+
+        ApiKey::FindCoordinator => {
+            let outcome = group_api::find_coordinator(
+                &mut r, &mut w, version, NODE_ID, &info.host, info.port,
+            );
+            if let Err(e) = outcome {
+                return bad_body("FindCoordinator", e);
+            }
+        }
+        ApiKey::JoinGroup => {
+            if let Err(e) = group_api::join_group(&mut r, &mut w, version, coordinator) {
+                return bad_body("JoinGroup", e);
+            }
+        }
+        ApiKey::SyncGroup => {
+            if let Err(e) = group_api::sync_group(&mut r, &mut w, version, coordinator) {
+                return bad_body("SyncGroup", e);
+            }
+        }
+        ApiKey::Heartbeat => {
+            if let Err(e) = group_api::heartbeat(&mut r, &mut w, version, coordinator) {
+                return bad_body("Heartbeat", e);
+            }
+        }
+        ApiKey::LeaveGroup => {
+            if let Err(e) = group_api::leave_group(&mut r, &mut w, version, coordinator) {
+                return bad_body("LeaveGroup", e);
+            }
+        }
+        ApiKey::OffsetCommit => {
+            if let Err(e) = group_api::offset_commit(&mut r, &mut w, version, broker, coordinator) {
+                return bad_body("OffsetCommit", e);
+            }
+        }
+        ApiKey::OffsetFetch => {
+            if let Err(e) = group_api::offset_fetch(&mut r, &mut w, version, coordinator) {
+                return bad_body("OffsetFetch", e);
+            }
         }
     }
 

@@ -32,6 +32,7 @@
 use std::fmt;
 
 use crate::crc32c;
+use crate::protocol::{Reader, Writer};
 
 /// Bytes before the first record.
 pub const HEADER_LEN: usize = 61;
@@ -173,6 +174,118 @@ pub fn parse_all(bytes: &[u8]) -> Result<Vec<Batch>, Error> {
 /// nothing has to be recomputed.
 pub fn stamp_base_offset(bytes: &mut [u8], offset: i64) {
     bytes[..8].copy_from_slice(&offset.to_be_bytes());
+}
+
+/// A record as the broker reads and writes them: a key, and a value that is
+/// `None` for a tombstone.
+pub type Record = (Vec<u8>, Option<Vec<u8>>);
+
+/// Builds a batch from key/value pairs, for the records the broker writes
+/// itself rather than relays. Consumer offsets go through here.
+///
+/// The base offset is left at zero; the log stamps the real one on append.
+pub fn build(records: &[Record]) -> Vec<u8> {
+    let mut body = Writer::new();
+    for (index, (key, value)) in records.iter().enumerate() {
+        let mut record = Writer::new();
+        record.i8(0); // attributes, unused per record
+        record.varlong(0); // timestamp_delta
+        record.varint(index as i32); // offset_delta
+        record.varint(key.len() as i32);
+        record.raw(key);
+        match value {
+            Some(v) => {
+                record.varint(v.len() as i32);
+                record.raw(v);
+            }
+            // A null value is a tombstone: compaction would drop the key.
+            None => record.varint(-1),
+        }
+        record.varint(0); // headers
+
+        let record = record.into_inner();
+        body.varint(record.len() as i32);
+        body.raw(&record);
+    }
+    let body = body.into_inner();
+
+    let mut out = Writer::new();
+    out.i64(0); // base_offset, assigned on append
+    out.i32(0); // batch_length, filled in below
+    out.i32(0); // partition_leader_epoch
+    out.i8(2); // magic
+    out.i32(0); // crc, filled in below
+    out.i16(0); // attributes
+    out.i32(records.len() as i32 - 1); // last_offset_delta
+    out.i64(0); // base_timestamp
+    out.i64(0); // max_timestamp
+    out.i64(-1); // producer_id
+    out.i16(-1); // producer_epoch
+    out.i32(-1); // base_sequence
+    out.i32(records.len() as i32);
+    out.raw(&body);
+
+    let mut out = out.into_inner();
+    let batch_length = (out.len() - LENGTH_PREFIX) as i32;
+    out[8..12].copy_from_slice(&batch_length.to_be_bytes());
+    let crc = crc32c::checksum(&out[CRC_FROM..]);
+    out[17..21].copy_from_slice(&crc.to_be_bytes());
+    out
+}
+
+/// Key/value pairs out of a batch, for replaying a log the broker wrote.
+pub fn records(bytes: &[u8]) -> Result<Vec<Record>, Error> {
+    let mut out = Vec::new();
+    let mut at = 0;
+
+    while at < bytes.len() {
+        let parsed = parse(&bytes[at..])?;
+        let mut r = Reader::new(&bytes[at + HEADER_LEN..at + parsed.total_len]);
+
+        for _ in 0..parsed.record_count {
+            if read_record(&mut r, &mut out).is_err() {
+                // A record this broker did not write, or one using a feature
+                // it does not read. The batch checksum already passed, so the
+                // bytes are intact; there is just nothing here for us.
+                break;
+            }
+        }
+        at += parsed.total_len;
+    }
+
+    Ok(out)
+}
+
+fn read_record(r: &mut Reader, out: &mut Vec<Record>) -> Result<(), crate::protocol::Error> {
+    let len = r.varint()? as usize;
+    let before = r.remaining();
+
+    r.i8()?; // attributes
+    r.varlong()?; // timestamp_delta
+    r.varint()?; // offset_delta
+
+    let key_len = r.varint()?;
+    let key = if key_len < 0 {
+        Vec::new()
+    } else {
+        r.take_bytes(key_len as usize)?.to_vec()
+    };
+
+    let value_len = r.varint()?;
+    let value = if value_len < 0 {
+        None
+    } else {
+        Some(r.take_bytes(value_len as usize)?.to_vec())
+    };
+
+    // Skip headers and anything else this version of the record carries.
+    let consumed = before - r.remaining();
+    if len > consumed {
+        r.take_bytes(len - consumed)?;
+    }
+
+    out.push((key, value));
+    Ok(())
 }
 
 fn i32(bytes: &[u8], at: usize) -> i32 {

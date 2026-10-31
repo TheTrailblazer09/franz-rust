@@ -68,6 +68,11 @@ pub mod codes {
     pub const OFFSET_OUT_OF_RANGE: i16 = 1;
     pub const CORRUPT_MESSAGE: i16 = 2;
     pub const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+    pub const ILLEGAL_GENERATION: i16 = 22;
+    pub const INCONSISTENT_GROUP_PROTOCOL: i16 = 23;
+    pub const INVALID_GROUP_ID: i16 = 24;
+    pub const UNKNOWN_MEMBER_ID: i16 = 25;
+    pub const REBALANCE_IN_PROGRESS: i16 = 27;
     pub const UNSUPPORTED_VERSION: i16 = 35;
     pub const UNKNOWN_SERVER_ERROR: i16 = -1;
 }
@@ -139,6 +144,11 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// Exactly `n` bytes, for fields whose length came from somewhere else.
+    pub fn take_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
+        self.take(n)
+    }
+
     pub fn bool(&mut self) -> Result<bool> {
         Ok(self.take(1)?[0] != 0)
     }
@@ -150,6 +160,24 @@ impl<'a> Reader<'a> {
     pub fn i64(&mut self) -> Result<i64> {
         let b = self.take(8)?;
         Ok(i64::from_be_bytes(b.try_into().expect("took eight bytes")))
+    }
+
+    pub fn varint(&mut self) -> Result<i32> {
+        let n = self.uvarint()?;
+        Ok(((n >> 1) as i32) ^ -((n & 1) as i32))
+    }
+
+    pub fn varlong(&mut self) -> Result<i64> {
+        let at = self.pos;
+        let mut out: u64 = 0;
+        for shift in (0..64).step_by(7) {
+            let b = self.take(1)?[0];
+            out |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                return Ok(((out >> 1) as i64) ^ -((out & 1) as i64));
+            }
+        }
+        Err(Error::BadVarint { at })
     }
 
     /// An int32 length then that many bytes, where -1 means null. Record
@@ -276,8 +304,28 @@ impl Writer {
         self.buf.push(b as u8);
     }
 
+    pub fn i8(&mut self, n: i8) {
+        self.buf.push(n as u8);
+    }
+
     pub fn i64(&mut self, n: i64) {
         self.buf.extend_from_slice(&n.to_be_bytes());
+    }
+
+    /// Zigzag varint: record fields inside a batch use these, so -1 costs one
+    /// byte rather than five.
+    pub fn varint(&mut self, n: i32) {
+        self.uvarint(((n << 1) ^ (n >> 31)) as u32);
+    }
+
+    pub fn varlong(&mut self, n: i64) {
+        let zigzag = ((n << 1) ^ (n >> 63)) as u64;
+        let mut n = zigzag;
+        while n >= 0x80 {
+            self.buf.push((n as u8) | 0x80);
+            n >>= 7;
+        }
+        self.buf.push(n as u8);
     }
 
     pub fn raw(&mut self, bytes: &[u8]) {
@@ -361,6 +409,13 @@ pub enum ApiKey {
     Fetch = 1,
     ListOffsets = 2,
     Metadata = 3,
+    OffsetCommit = 8,
+    OffsetFetch = 9,
+    FindCoordinator = 10,
+    JoinGroup = 11,
+    Heartbeat = 12,
+    LeaveGroup = 13,
+    SyncGroup = 14,
     ApiVersions = 18,
 }
 
@@ -372,6 +427,13 @@ impl ApiKey {
         ApiKey::Fetch,
         ApiKey::ListOffsets,
         ApiKey::Metadata,
+        ApiKey::OffsetCommit,
+        ApiKey::OffsetFetch,
+        ApiKey::FindCoordinator,
+        ApiKey::JoinGroup,
+        ApiKey::Heartbeat,
+        ApiKey::LeaveGroup,
+        ApiKey::SyncGroup,
         ApiKey::ApiVersions,
     ];
 
@@ -381,6 +443,13 @@ impl ApiKey {
             1 => Ok(ApiKey::Fetch),
             2 => Ok(ApiKey::ListOffsets),
             3 => Ok(ApiKey::Metadata),
+            8 => Ok(ApiKey::OffsetCommit),
+            9 => Ok(ApiKey::OffsetFetch),
+            10 => Ok(ApiKey::FindCoordinator),
+            11 => Ok(ApiKey::JoinGroup),
+            12 => Ok(ApiKey::Heartbeat),
+            13 => Ok(ApiKey::LeaveGroup),
+            14 => Ok(ApiKey::SyncGroup),
             18 => Ok(ApiKey::ApiVersions),
             other => Err(Error::UnknownApiKey(other)),
         }
@@ -392,6 +461,13 @@ impl ApiKey {
             ApiKey::Fetch => "Fetch",
             ApiKey::ListOffsets => "ListOffsets",
             ApiKey::Metadata => "Metadata",
+            ApiKey::OffsetCommit => "OffsetCommit",
+            ApiKey::OffsetFetch => "OffsetFetch",
+            ApiKey::FindCoordinator => "FindCoordinator",
+            ApiKey::JoinGroup => "JoinGroup",
+            ApiKey::Heartbeat => "Heartbeat",
+            ApiKey::LeaveGroup => "LeaveGroup",
+            ApiKey::SyncGroup => "SyncGroup",
             ApiKey::ApiVersions => "ApiVersions",
         }
     }
@@ -409,6 +485,13 @@ impl ApiKey {
             ApiKey::Fetch => Some((1, 11)),
             ApiKey::ListOffsets => Some((1, 5)),
             ApiKey::Metadata => Some((0, 12)),
+            ApiKey::OffsetCommit => Some((0, 7)),
+            ApiKey::OffsetFetch => Some((0, 5)),
+            ApiKey::FindCoordinator => Some((0, 2)),
+            ApiKey::JoinGroup => Some((0, 5)),
+            ApiKey::Heartbeat => Some((0, 3)),
+            ApiKey::LeaveGroup => Some((0, 3)),
+            ApiKey::SyncGroup => Some((0, 3)),
             ApiKey::ApiVersions => Some((0, 3)),
         }
     }
@@ -424,6 +507,13 @@ impl ApiKey {
             ApiKey::Fetch => 12,
             ApiKey::ListOffsets => 6,
             ApiKey::Metadata => 9,
+            ApiKey::OffsetCommit => 8,
+            ApiKey::OffsetFetch => 6,
+            ApiKey::FindCoordinator => 3,
+            ApiKey::JoinGroup => 6,
+            ApiKey::Heartbeat => 4,
+            ApiKey::LeaveGroup => 4,
+            ApiKey::SyncGroup => 4,
             ApiKey::ApiVersions => 3,
         }
     }

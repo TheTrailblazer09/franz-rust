@@ -126,7 +126,11 @@ mod tests {
     #[test]
     fn we_advertise_every_api_we_implement_and_nothing_else() {
         let keys: Vec<i16> = advertised().iter().map(|r| r.api_key).collect();
-        assert_eq!(keys, [0, 1, 2, 3, 18], "ascending api_key order");
+        assert_eq!(
+            keys,
+            [0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 18],
+            "ascending api_key order"
+        );
 
         // Produce, Fetch and ListOffsets deliberately stop below the version
         // where each turns flexible.

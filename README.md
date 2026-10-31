@@ -57,6 +57,13 @@ advertising it gives you a client that reads metadata once and then hangs.
 | `Produce` | 3–8 | Record batch v2, CRC-32C validated, `acks=0/1/all` |
 | `Fetch` | 1–11 | `max_wait_ms` long-polling, `min_bytes` |
 | `ListOffsets` | 1–5 | Earliest and latest |
+| `FindCoordinator` | 0–2 | Group coordinator lookup |
+| `JoinGroup` | 0–5 | Rebalance round one |
+| `SyncGroup` | 0–3 | Assignment distribution |
+| `Heartbeat` | 0–3 | Liveness, triggers rebalance |
+| `LeaveGroup` | 0–3 | Clean shutdown |
+| `OffsetCommit` | 0–7 | Durable consumer position |
+| `OffsetFetch` | 0–5 | Resume position |
 
 `Produce`, `Fetch` and `ListOffsets` deliberately stop one version below where
 each turns flexible. That keeps one encoding per API instead of two, and costs
@@ -175,8 +182,9 @@ power loss or a fault-injection layer that fails a write partway.
 ## Testing
 
 ```
-cargo test              # 41 unit tests
+cargo test              # 44 unit tests
 scripts/crash_test.sh   # SIGKILL loop
+scripts/group_test.sh   # two real consumers sharing a topic
 scripts/bench.sh        # throughput table above
 ```
 
@@ -190,7 +198,6 @@ are wrong.
 
 | Not implemented | Why |
 | --- | --- |
-| Consumer groups | The coordinator, rebalance protocol and `__consumer_offsets` are a project of their own. A simple consumer (`kcat -C`) works; `kcat -G` does not |
 | Replication | Single node. Every partition reports itself as leader and sole ISR |
 | Transactions, exactly-once | Needs a transaction coordinator and producer fencing |
 | Log compaction | A second storage engine with its own index |
@@ -208,14 +215,66 @@ Two known rough edges, stated rather than hidden:
   partition wakes every waiter. Correct, but it does more work than a
   per-partition signal would under many idle consumers.
 
-## Roadmap
 
-- [x] A TCP server that reads length-prefixed Kafka frames
-- [x] Answer `ApiVersions`, so a client finishes its handshake
-- [x] Answer `Metadata`, so `kcat -L` lists topics
-- [x] Append records to a segmented log on disk
-- [x] Answer `Produce`, so `kcat -P` writes
-- [x] Answer `Fetch`, so `kcat -C` reads it back
-- [x] Survive `SIGKILL` mid-write with no acknowledged data lost
-- [ ] Consumer groups
+- [x] Consumer groups
 - [ ] Replication across brokers
+
+## Consumer groups
+
+A group splits a topic's partitions across its members, nobody reads the same
+partition as anybody else, and position survives a restart.
+
+The broker does not compute the assignment. It picks the first member to join
+as leader, forwards every member's subscription to that leader, and the leader
+decides who gets what and sends the answer back in `SyncGroup`. The coordinator
+only distributes the result. That is why franz works with clients using range,
+round-robin or sticky assignors without implementing any of them — the strategy
+lives in the client and travels as opaque bytes.
+
+Offsets are stored by appending to `__consumer_offsets`, a topic like any
+other, and the map is rebuilt by replaying that topic at startup. Reusing the
+log costs almost nothing once the log exists. The key and value encoding is
+franz's own rather than Kafka's, so a franz data directory is not readable by a
+real broker.
+
+`scripts/group_test.sh` runs two real `kcat` consumers against one topic:
+
+```
+produced 400 records across 4 partitions
+
+one consumer takes every partition
+  ok    read all 400 records
+
+the same group resumes where it left off
+  ok    read nothing the second time
+
+two consumers split the partitions
+  consumer A: 200 records from partitions 0,1
+  consumer B: 200 records from partitions 2,3
+  ok    every record read once
+  ok    no record read twice
+  ok    no partition shared
+  ok    both consumers got work
+
+killing one consumer hands its partitions to the other
+  survivor read 4 new record(s) across 4 partition(s)
+  ok    survivor picked up all 4 partitions
+
+committed offsets survive a broker restart
+  ok    offsets replayed from __consumer_offsets
+  ok    group 'solo' still only sees the new records
+```
+
+Two things in here cost real time to get right.
+
+**A committed offset is the next offset to read, not the last one read.** Off by
+one and every restart silently replays or skips exactly one record per
+partition, which no casual test catches.
+
+**A `SyncGroup` from a generation the group has left must be rejected.** Two
+consumers starting at the same moment race: the first completes a rebalance
+alone and takes every partition, the second's join starts a new rebalance, and
+then the first consumer's `SyncGroup` — computed for the *old* generation —
+arrives and marks the group stable again. The second member ends up holding an
+empty assignment and reads nothing, forever, with no error anywhere. The fix is
+three lines; finding it took a packet trace.

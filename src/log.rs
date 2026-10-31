@@ -437,6 +437,8 @@ impl From<io::Error> for AppendError {
     }
 }
 
+impl std::error::Error for AppendError {}
+
 impl std::fmt::Display for AppendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
