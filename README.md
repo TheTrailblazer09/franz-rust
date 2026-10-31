@@ -5,6 +5,27 @@ A Kafka-compatible event streaming broker, written in Rust.
 Real Kafka clients — `kcat`, `librdkafka`, the Java client — can produce to it
 and consume from it without knowing it isn't Kafka.
 
+## Why build another Kafka
+
+Not to replace it. Kafka is excellent, this is not a competitor, and nobody
+should run it in production.
+
+The reason is that Kafka is a black box exactly where you most want it open.
+You cannot make its disk lie to it on demand. You cannot ask it to persist the
+first 300 bytes of an unsynced write, drop the rest, and then tell you what it
+believes about its own log. You cannot stop its recovery scan halfway. Those
+are the behaviours that decide whether a log can be trusted, and they are
+precisely the ones you cannot observe from outside — so the usual way to learn
+them is to read the source and hope you understood it.
+
+franz is small enough to instrument instead. Every byte it writes passes
+through one trait, so [the simulator](#the-crash-simulator) can swap the disk
+for one that loses and tears writes on command, and then assert — from a 64-bit
+seed, reproducibly — that nothing acknowledged went missing. The broker exists
+so that experiment can be run; the experiment is the point.
+
+That is also why it speaks the real protocol rather than one of its own.
+
 ## Why wire compatibility
 
 If you invent your own protocol, the only client you can test against is one you
