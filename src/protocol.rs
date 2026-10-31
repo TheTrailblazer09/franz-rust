@@ -4,13 +4,6 @@
 //! out the primitive types the protocol is built from, and fails rather than
 //! panicking when a frame is shorter than it claims. [`RequestHeader`] is the
 //! fixed preamble every request begins with, whatever the operation.
-//!
-//! The rule worth stating once: whether a field uses the compact encoding is
-//! decided per API by [`ApiKey::flexible_since`], never by a flag on the
-//! reader. `Metadata` became flexible at v9 while `Fetch` waited until v12, so
-//! a reader that tracked "flexible" as connection state would be right for one
-//! and wrong for the other. When it is wrong the frame still decodes — the
-//! fields just land a byte off, and the client hangs with no error to read.
 
 use std::fmt;
 
@@ -18,13 +11,18 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
-    /// Asked for more bytes than the frame holds.
-    Truncated { want: usize, have: usize, at: usize },
+    Truncated {
+        want: usize,
+        have: usize,
+        at: usize,
+    },
     /// A varint ran past its maximum width, so these bytes are not a varint.
-    BadVarint { at: usize },
-    /// A string field was not valid UTF-8.
-    BadUtf8 { at: usize },
-    /// An api_key this broker has never heard of.
+    BadVarint {
+        at: usize,
+    },
+    BadUtf8 {
+        at: usize,
+    },
     UnknownApiKey(i16),
 }
 
@@ -49,6 +47,16 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// Kafka error codes, as they appear on the wire.
+///
+/// These belong to the protocol, not to this implementation: clients branch on
+/// them, and several are instructions rather than complaints. Returning a
+/// wrong-but-plausible code turns a recoverable situation into a stuck client.
+pub mod codes {
+    pub const NONE: i16 = 0;
+    pub const UNSUPPORTED_VERSION: i16 = 35;
+}
 
 // --- reading bytes ----------------------------------------------------------
 
@@ -89,10 +97,7 @@ impl<'a> Reader<'a> {
         Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
-    /// Unsigned varint: seven bits of value per byte, low groups first, with
-    /// the high bit set on every byte but the last. Compact lengths and tag
-    /// numbers use these, which is how a short string costs one byte of
-    /// overhead instead of two.
+    /// Unsigned varint
     pub fn uvarint(&mut self) -> Result<u32> {
         let at = self.pos;
         let mut out: u32 = 0;
@@ -137,6 +142,72 @@ impl<'a> Reader<'a> {
     }
 }
 
+// --- writing bytes ----------------------------------------------------------
+
+/// The mirror of [`Reader`]. Appends to a buffer and cannot fail, which is why
+/// none of these return a `Result` and encoding a response needs no error
+/// handling at all.
+#[derive(Default)]
+pub struct Writer {
+    buf: Vec<u8>,
+}
+
+impl Writer {
+    pub fn new() -> Self {
+        Writer::default()
+    }
+
+    pub fn into_inner(self) -> Vec<u8> {
+        self.buf
+    }
+
+    pub fn i16(&mut self, n: i16) {
+        self.buf.extend_from_slice(&n.to_be_bytes());
+    }
+
+    pub fn i32(&mut self, n: i32) {
+        self.buf.extend_from_slice(&n.to_be_bytes());
+    }
+
+    pub fn uvarint(&mut self, mut n: u32) {
+        while n >= 0x80 {
+            self.buf.push((n as u8) | 0x80);
+            n >>= 7;
+        }
+        self.buf.push(n as u8);
+    }
+
+    /// Array length in the classic encoding: an int32, where -1 means null.
+    pub fn array_len(&mut self, n: usize) {
+        self.i32(n as i32);
+    }
+
+    /// Array length in the compact encoding: an unsigned varint of length plus
+    /// one, which leaves zero free to mean null.
+    pub fn compact_array_len(&mut self, n: usize) {
+        self.uvarint(n as u32 + 1);
+    }
+
+    pub fn empty_tagged_fields(&mut self) {
+        self.uvarint(0);
+    }
+}
+
+/// Writes the response preamble: the correlation_id the client matches this
+/// reply against, and a tagged-field buffer if this API is flexible here.
+///
+/// `ApiVersions` is the exception, and it has to be special-cased or no client
+/// gets past the handshake: its response always uses header v0, with no tagged
+/// fields, even at v3 where the body *is* flexible. The client must parse this
+/// response before it knows anything about the broker, so the one reply whose
+/// shape it cannot negotiate is pinned forever.
+pub fn write_response_header(w: &mut Writer, api_key: ApiKey, version: i16, correlation_id: i32) {
+    w.i32(correlation_id);
+    if api_key != ApiKey::ApiVersions && api_key.is_flexible(version) {
+        w.empty_tagged_fields();
+    }
+}
+
 // --- what the client asked for ----------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +220,16 @@ pub enum ApiKey {
 }
 
 impl ApiKey {
+    /// Rust has no equivalent of Java's `values()`, so the list is written out.
+    /// `all_lists_every_api_key_we_recognise` keeps it honest.
+    pub const ALL: &'static [ApiKey] = &[
+        ApiKey::Produce,
+        ApiKey::Fetch,
+        ApiKey::ListOffsets,
+        ApiKey::Metadata,
+        ApiKey::ApiVersions,
+    ];
+
     pub fn from_i16(key: i16) -> Result<Self> {
         match key {
             0 => Ok(ApiKey::Produce),
@@ -170,6 +251,27 @@ impl ApiKey {
         }
     }
 
+    /// Inclusive version range this broker implements, or `None` if it does
+    /// not implement the API at all. This is exactly what `ApiVersions`
+    /// advertises, so a client that read that response will never ask for
+    /// anything outside it.
+    ///
+    /// Spelled out one variant at a time rather than with a catch-all, so
+    /// adding an API to the enum stops compiling until its range is declared.
+    pub fn supported(self) -> Option<(i16, i16)> {
+        match self {
+            ApiKey::Produce => None,
+            ApiKey::Fetch => None,
+            ApiKey::ListOffsets => None,
+            ApiKey::Metadata => None,
+            ApiKey::ApiVersions => Some((0, 3)),
+        }
+    }
+
+    pub fn supports(self, version: i16) -> bool {
+        matches!(self.supported(), Some((lo, hi)) if version >= lo && version <= hi)
+    }
+
     /// First version of this API encoded with compact types and tagged fields.
     fn flexible_since(self) -> i16 {
         match self {
@@ -187,11 +289,7 @@ impl ApiKey {
 }
 
 /// The preamble on every request, whatever the operation.
-///
-/// `client_id` is the trap. The header gained its tagged-field buffer when it
-/// went flexible, but `client_id` stayed an int16-prefixed string rather than
-/// becoming compact — so a single flexible request carries both encodings, and
-/// assuming otherwise puts every later field one byte out.
+
 #[derive(Debug)]
 pub struct RequestHeader {
     pub api_key: ApiKey,
@@ -224,9 +322,6 @@ impl RequestHeader {
 mod tests {
     use super::*;
 
-    /// Captured from `kcat -L` 1.7.0 against this broker. Not written by hand:
-    /// a client that has never seen this code is the only way to find out
-    /// whether the parsing matches the real protocol or only matches itself.
     const KCAT_API_VERSIONS: &[u8] = &[
         0x00, 0x12, // api_key 18, ApiVersions
         0x00, 0x03, // api_version 3
@@ -286,6 +381,18 @@ mod tests {
                 have: 1,
                 at: 2
             }
+        );
+    }
+
+    #[test]
+    fn all_lists_every_api_key_we_recognise() {
+        let recognised: Vec<ApiKey> = (0..=100i16)
+            .filter_map(|k| ApiKey::from_i16(k).ok())
+            .collect();
+        assert_eq!(
+            recognised,
+            ApiKey::ALL,
+            "ApiKey::ALL has drifted from from_i16"
         );
     }
 

@@ -1,16 +1,12 @@
 //! franz: a broker that speaks the Apache Kafka wire protocol.
-//! Step 1 reads messages off the wire and prints them. Nothing is answered
-//! yet. The point is to establish the one rule everything later depends on:
-//! every Kafka message is a 4-byte big-endian length followed by exactly that
-//! many bytes. Read the length, read exactly that many bytes, then parse.
-//!
 
+mod api_versions;
 mod protocol;
 
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
-use crate::protocol::{Reader, RequestHeader};
+use crate::protocol::{ApiKey, Reader, RequestHeader, Writer, codes, write_response_header};
 
 const LISTEN: &str = "127.0.0.1:9092";
 
@@ -49,24 +45,71 @@ fn serve(mut client: TcpStream) -> std::io::Result<()> {
 
         println!("\nframe of {len} bytes:");
         hexdump(&frame);
-        describe(&frame);
+
+        let Some(body) = respond(&frame) else {
+            println!("  nothing to say, closing");
+            return Ok(());
+        };
+
+        println!("  replying with {} bytes:", body.len());
+        hexdump(&body);
+        client.write_all(&(body.len() as u32).to_be_bytes())?;
+        client.write_all(&body)?;
+        client.flush()?;
     }
 }
 
-/// Says what the client asked for, without acting on it.
-fn describe(frame: &[u8]) {
+/// Builds the response body for one request, or `None` when there is nothing
+/// safe to say and the connection should be dropped.
+///
+/// Once decoding has failed there is no response shape left to guess at, and a
+/// client that keeps writing into a desynchronised connection only corrupts
+/// requests that would otherwise have been fine.
+fn respond(frame: &[u8]) -> Option<Vec<u8>> {
     let mut r = Reader::new(frame);
-    match RequestHeader::decode(&mut r) {
-        Ok(h) => println!(
-            "  {} v{} from {}, correlation_id {}, {} bytes of body",
-            h.api_key.name(),
-            h.api_version,
-            h.client_id.as_deref().unwrap_or("(no client_id)"),
-            h.correlation_id,
-            r.remaining(),
-        ),
-        Err(e) => println!("  unparseable: {e}"),
+    let header = match RequestHeader::decode(&mut r) {
+        Ok(header) => header,
+        Err(e) => {
+            println!("  unparseable: {e}");
+            return None;
+        }
+    };
+
+    println!(
+        "  {} v{} from {}, correlation_id {}, {} bytes of body",
+        header.api_key.name(),
+        header.api_version,
+        header.client_id.as_deref().unwrap_or("(no client_id)"),
+        header.correlation_id,
+        r.remaining(),
+    );
+
+    let mut w = Writer::new();
+    write_response_header(
+        &mut w,
+        header.api_key,
+        header.api_version,
+        header.correlation_id,
+    );
+
+    match header.api_key {
+        ApiKey::ApiVersions if !header.api_key.supports(header.api_version) => {
+            println!(
+                "  v{} is past what we speak, telling it to retry",
+                header.api_version
+            );
+            api_versions::write_unsupported(&mut w);
+        }
+        ApiKey::ApiVersions => {
+            api_versions::write_response(&mut w, header.api_version, codes::NONE)
+        }
+        other => {
+            println!("  {} has no handler yet", other.name());
+            return None;
+        }
     }
+
+    Some(w.into_inner())
 }
 
 fn hexdump(bytes: &[u8]) {
