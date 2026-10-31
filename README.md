@@ -21,7 +21,7 @@ Each step is something you can run and see working.
 
 - [x] A TCP server that reads length-prefixed Kafka frames
 - [x] Answer `ApiVersions`, so a client finishes its handshake
-- [ ] Answer `Metadata`, so `kcat -L` lists topics
+- [x] Answer `Metadata`, so `kcat -L` lists topics
 - [ ] Append records to a segmented log on disk
 - [ ] Answer `Produce`, so `kcat -P` writes
 - [ ] Answer `Fetch`, so `kcat -C` reads it back

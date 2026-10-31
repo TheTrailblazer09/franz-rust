@@ -23,6 +23,10 @@ pub enum Error {
     BadUtf8 {
         at: usize,
     },
+    UnexpectedNull {
+        field: &'static str,
+        at: usize,
+    },
     UnknownApiKey(i16),
 }
 
@@ -41,6 +45,12 @@ impl fmt::Display for Error {
                  read with the wrong encoding for this API version"
             ),
             Error::BadUtf8 { at } => write!(f, "string at offset {at} is not valid UTF-8"),
+            Error::UnexpectedNull { field, at } => {
+                write!(
+                    f,
+                    "{field} at offset {at} is null, which this version forbids"
+                )
+            }
             Error::UnknownApiKey(k) => write!(f, "api_key {k} is not one this broker knows"),
         }
     }
@@ -55,6 +65,7 @@ impl std::error::Error for Error {}
 /// wrong-but-plausible code turns a recoverable situation into a stuck client.
 pub mod codes {
     pub const NONE: i16 = 0;
+    pub const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
     pub const UNSUPPORTED_VERSION: i16 = 35;
 }
 
@@ -125,6 +136,59 @@ impl<'a> Reader<'a> {
         }
     }
 
+    pub fn bool(&mut self) -> Result<bool> {
+        Ok(self.take(1)?[0] != 0)
+    }
+
+    pub fn uuid(&mut self) -> Result<[u8; 16]> {
+        let mut id = [0u8; 16];
+        id.copy_from_slice(self.take(16)?);
+        Ok(id)
+    }
+
+    pub fn string(&mut self) -> Result<String> {
+        let at = self.pos;
+        self.nullable_string()?.ok_or(Error::UnexpectedNull {
+            field: "string",
+            at,
+        })
+    }
+
+    /// Unsigned varint of length + 1, so zero means null.
+    pub fn compact_nullable_string(&mut self) -> Result<Option<String>> {
+        let at = self.pos;
+        let len = self.uvarint()?;
+        if len == 0 {
+            return Ok(None);
+        }
+        let bytes = self.take(len as usize - 1)?;
+        match std::str::from_utf8(bytes) {
+            Ok(s) => Ok(Some(s.to_owned())),
+            Err(_) => Err(Error::BadUtf8 { at }),
+        }
+    }
+
+    /// `None` is a null array, which is not an empty one: null topics in a
+    /// Metadata request means every topic.
+    ///
+    /// Callers loop and push rather than reserving the count, which the client
+    /// controls.
+    pub fn array_len(&mut self) -> Result<Option<usize>> {
+        let n = self.i32()?;
+        if n < 0 {
+            return Ok(None);
+        }
+        Ok(Some(n as usize))
+    }
+
+    pub fn compact_array_len(&mut self) -> Result<Option<usize>> {
+        let n = self.uvarint()?;
+        if n == 0 {
+            return Ok(None);
+        }
+        Ok(Some(n as usize - 1))
+    }
+
     /// Tagged fields, skipped wholesale.
     ///
     /// This is Kafka's forward-compatibility escape hatch: a count, then that
@@ -175,6 +239,38 @@ impl Writer {
             n >>= 7;
         }
         self.buf.push(n as u8);
+    }
+
+    pub fn bool(&mut self, b: bool) {
+        self.buf.push(b as u8);
+    }
+
+    pub fn uuid(&mut self, id: &[u8; 16]) {
+        self.buf.extend_from_slice(id);
+    }
+
+    pub fn string(&mut self, s: &str) {
+        self.i16(s.len() as i16);
+        self.buf.extend_from_slice(s.as_bytes());
+    }
+
+    pub fn nullable_string(&mut self, s: Option<&str>) {
+        match s {
+            Some(s) => self.string(s),
+            None => self.i16(-1),
+        }
+    }
+
+    pub fn compact_string(&mut self, s: &str) {
+        self.uvarint(s.len() as u32 + 1);
+        self.buf.extend_from_slice(s.as_bytes());
+    }
+
+    pub fn compact_nullable_string(&mut self, s: Option<&str>) {
+        match s {
+            Some(s) => self.compact_string(s),
+            None => self.uvarint(0),
+        }
     }
 
     /// Array length in the classic encoding: an int32, where -1 means null.
@@ -263,7 +359,7 @@ impl ApiKey {
             ApiKey::Produce => None,
             ApiKey::Fetch => None,
             ApiKey::ListOffsets => None,
-            ApiKey::Metadata => None,
+            ApiKey::Metadata => Some((0, 12)),
             ApiKey::ApiVersions => Some((0, 3)),
         }
     }

@@ -1,25 +1,45 @@
 //! franz: a broker that speaks the Apache Kafka wire protocol.
 
 mod api_versions;
+mod metadata;
 mod protocol;
+mod topics;
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
+use crate::metadata::BrokerInfo;
 use crate::protocol::{ApiKey, Reader, RequestHeader, Writer, codes, write_response_header};
+use crate::topics::Topics;
 
-const LISTEN: &str = "127.0.0.1:9092";
+const HOST: &str = "127.0.0.1";
+const PORT: u16 = 9092;
+const NODE_ID: i32 = 1;
+const CLUSTER_ID: &str = "franz-dev";
 
 fn main() -> std::io::Result<()> {
-    let listener = TcpListener::bind(LISTEN)?;
-    println!("franz listening on {LISTEN}");
+    let topics = match parse_args() {
+        Ok(topics) => topics,
+        Err(e) => {
+            eprintln!("franz: {e}");
+            eprintln!("usage: franz [--topic NAME:PARTITIONS]...");
+            std::process::exit(2);
+        }
+    };
+
+    let listen = format!("{HOST}:{PORT}");
+    let listener = TcpListener::bind(&listen)?;
+    println!("franz listening on {listen}");
+    for t in topics.all() {
+        println!("  topic {} with {} partitions", t.name, t.partitions);
+    }
 
     for client in listener.incoming() {
         let client = client?;
         let peer = client.peer_addr()?;
         println!("\n{peer} connected");
 
-        match serve(client) {
+        match serve(client, &topics) {
             Ok(()) => println!("{peer} disconnected"),
             Err(e) => println!("{peer} dropped: {e}"),
         }
@@ -28,8 +48,28 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
+/// `--topic NAME:PARTITIONS`, repeatable. An unrecognised argument is an
+/// error rather than ignored: a typo that silently creates no topics looks
+/// exactly like a broker bug from the client side.
+fn parse_args() -> Result<Topics, String> {
+    let mut specs = Vec::new();
+    let mut args = std::env::args().skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--topic" => {
+                let spec = args.next().ok_or("--topic needs NAME:PARTITIONS")?;
+                specs.push(spec);
+            }
+            other => return Err(format!("unknown argument `{other}`")),
+        }
+    }
+
+    Topics::from_specs(&specs)
+}
+
 /// Reads frames until the client goes away.
-fn serve(mut client: TcpStream) -> std::io::Result<()> {
+fn serve(mut client: TcpStream, topics: &Topics) -> std::io::Result<()> {
     loop {
         let mut prefix = [0u8; 4];
         match client.read_exact(&mut prefix) {
@@ -46,7 +86,7 @@ fn serve(mut client: TcpStream) -> std::io::Result<()> {
         println!("\nframe of {len} bytes:");
         hexdump(&frame);
 
-        let Some(body) = respond(&frame) else {
+        let Some(body) = respond(&frame, topics) else {
             println!("  nothing to say, closing");
             return Ok(());
         };
@@ -65,7 +105,7 @@ fn serve(mut client: TcpStream) -> std::io::Result<()> {
 /// Once decoding has failed there is no response shape left to guess at, and a
 /// client that keeps writing into a desynchronised connection only corrupts
 /// requests that would otherwise have been fine.
-fn respond(frame: &[u8]) -> Option<Vec<u8>> {
+fn respond(frame: &[u8], topics: &Topics) -> Option<Vec<u8>> {
     let mut r = Reader::new(frame);
     let header = match RequestHeader::decode(&mut r) {
         Ok(header) => header,
@@ -100,8 +140,38 @@ fn respond(frame: &[u8]) -> Option<Vec<u8>> {
             );
             api_versions::write_unsupported(&mut w);
         }
-        ApiKey::ApiVersions => {
-            api_versions::write_response(&mut w, header.api_version, codes::NONE)
+        ApiKey::ApiVersions => api_versions::write_response(
+            &mut w,
+            header.api_version,
+            codes::NONE,
+            &api_versions::advertised(),
+        ),
+        ApiKey::Metadata => {
+            let request = match metadata::Request::decode(&mut r, header.api_version) {
+                Ok(request) => request,
+                Err(e) => {
+                    println!("  bad Metadata body: {e}");
+                    return None;
+                }
+            };
+            match &request.topics {
+                None => println!("  asked about every topic"),
+                Some(names) => println!("  asked about {names:?}"),
+            }
+
+            let broker = BrokerInfo {
+                node_id: NODE_ID,
+                host: HOST,
+                port: PORT as i32,
+                cluster_id: CLUSTER_ID,
+            };
+            metadata::write_response(
+                &mut w,
+                header.api_version,
+                &broker,
+                topics,
+                request.topics.as_deref(),
+            );
         }
         other => {
             println!("  {} has no handler yet", other.name());
