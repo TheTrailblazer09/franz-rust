@@ -65,8 +65,11 @@ impl std::error::Error for Error {}
 /// wrong-but-plausible code turns a recoverable situation into a stuck client.
 pub mod codes {
     pub const NONE: i16 = 0;
+    pub const OFFSET_OUT_OF_RANGE: i16 = 1;
+    pub const CORRUPT_MESSAGE: i16 = 2;
     pub const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
     pub const UNSUPPORTED_VERSION: i16 = 35;
+    pub const UNKNOWN_SERVER_ERROR: i16 = -1;
 }
 
 // --- reading bytes ----------------------------------------------------------
@@ -138,6 +141,34 @@ impl<'a> Reader<'a> {
 
     pub fn bool(&mut self) -> Result<bool> {
         Ok(self.take(1)?[0] != 0)
+    }
+
+    pub fn i8(&mut self) -> Result<i8> {
+        Ok(self.take(1)?[0] as i8)
+    }
+
+    pub fn i64(&mut self) -> Result<i64> {
+        let b = self.take(8)?;
+        Ok(i64::from_be_bytes(b.try_into().expect("took eight bytes")))
+    }
+
+    /// An int32 length then that many bytes, where -1 means null. Record
+    /// batches arrive in one of these.
+    pub fn nullable_bytes(&mut self) -> Result<Option<&'a [u8]>> {
+        let at = self.pos;
+        let len = self.i32()?;
+        if len < 0 {
+            return Ok(None);
+        }
+        let len = len as usize;
+        if len > self.remaining() {
+            return Err(Error::Truncated {
+                want: len,
+                have: self.remaining(),
+                at,
+            });
+        }
+        Ok(Some(self.take(len)?))
     }
 
     pub fn uuid(&mut self) -> Result<[u8; 16]> {
@@ -243,6 +274,24 @@ impl Writer {
 
     pub fn bool(&mut self, b: bool) {
         self.buf.push(b as u8);
+    }
+
+    pub fn i64(&mut self, n: i64) {
+        self.buf.extend_from_slice(&n.to_be_bytes());
+    }
+
+    pub fn raw(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    pub fn nullable_bytes(&mut self, bytes: Option<&[u8]>) {
+        match bytes {
+            Some(b) => {
+                self.i32(b.len() as i32);
+                self.raw(b);
+            }
+            None => self.i32(-1),
+        }
     }
 
     pub fn uuid(&mut self, id: &[u8; 16]) {
@@ -356,9 +405,9 @@ impl ApiKey {
     /// adding an API to the enum stops compiling until its range is declared.
     pub fn supported(self) -> Option<(i16, i16)> {
         match self {
-            ApiKey::Produce => None,
-            ApiKey::Fetch => None,
-            ApiKey::ListOffsets => None,
+            ApiKey::Produce => Some((3, 8)),
+            ApiKey::Fetch => Some((1, 11)),
+            ApiKey::ListOffsets => Some((1, 5)),
             ApiKey::Metadata => Some((0, 12)),
             ApiKey::ApiVersions => Some((0, 3)),
         }

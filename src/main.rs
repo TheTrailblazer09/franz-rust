@@ -1,75 +1,212 @@
 //! franz: a broker that speaks the Apache Kafka wire protocol.
 
 mod api_versions;
+mod batch;
+mod broker;
+mod crc32c;
+mod fetch;
+mod list_offsets;
+mod log;
 mod metadata;
+mod produce;
 mod protocol;
 mod topics;
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use crate::broker::Broker;
 use crate::metadata::BrokerInfo;
 use crate::protocol::{ApiKey, Reader, RequestHeader, Writer, codes, write_response_header};
 use crate::topics::Topics;
 
-const HOST: &str = "127.0.0.1";
-const PORT: u16 = 9092;
 const NODE_ID: i32 = 1;
 const CLUSTER_ID: &str = "franz-dev";
 
+/// Largest frame we will read, matching Kafka's own default. Without a ceiling
+/// four bytes of noise can ask the broker to allocate whatever they can say.
+const MAX_FRAME_BYTES: u32 = 100 * 1024 * 1024;
+
+struct Settings {
+    host: String,
+    port: u16,
+    data_dir: PathBuf,
+    verbose: bool,
+    topics: Topics,
+    log: log::Config,
+}
+
+/// What to do with a request once it has been handled.
+enum Reply {
+    Send(Vec<u8>),
+    /// Produce with acks=0: the client is not waiting for anything, and
+    /// answering would desynchronise the connection.
+    Silent,
+    /// Nothing safe is left to say, so the connection goes.
+    Close,
+}
+
 fn main() -> std::io::Result<()> {
-    let topics = match parse_args() {
-        Ok(topics) => topics,
+    let settings = match parse_args() {
+        Ok(settings) => settings,
         Err(e) => {
             eprintln!("franz: {e}");
-            eprintln!("usage: franz [--topic NAME:PARTITIONS]...");
+            eprintln!("{USAGE}");
             std::process::exit(2);
         }
     };
 
-    let listen = format!("{HOST}:{PORT}");
+    println!(
+        "data in {}, fsync {}",
+        settings.data_dir.display(),
+        describe_sync(settings.log.sync)
+    );
+
+    // Opened before the port, so a client never connects to a broker that is
+    // still deciding where its logs end.
+    let opened = Instant::now();
+    let broker = Arc::new(Broker::open(
+        settings.topics,
+        &settings.data_dir,
+        settings.log,
+    )?);
+    println!("recovered in {:.3}s", opened.elapsed().as_secs_f64());
+
+    let listen = format!("{}:{}", settings.host, settings.port);
     let listener = TcpListener::bind(&listen)?;
     println!("franz listening on {listen}");
-    for t in topics.all() {
-        println!("  topic {} with {} partitions", t.name, t.partitions);
-    }
+
+    let info = Arc::new(BrokerInfoOwned {
+        host: settings.host,
+        port: settings.port as i32,
+    });
+    let verbose = settings.verbose;
 
     for client in listener.incoming() {
         let client = client?;
-        let peer = client.peer_addr()?;
-        println!("\n{peer} connected");
+        let broker = Arc::clone(&broker);
+        let info = Arc::clone(&info);
 
-        match serve(client, &topics) {
-            Ok(()) => println!("{peer} disconnected"),
-            Err(e) => println!("{peer} dropped: {e}"),
-        }
+        // A thread each, rather than one connection at a time. Clients keep
+        // several connections open at once and expect all of them served.
+        std::thread::spawn(move || {
+            let peer = match client.peer_addr() {
+                Ok(peer) => peer,
+                Err(_) => return,
+            };
+            // Request and response over a long-lived connection, so Nagle has
+            // nothing to batch and only delays each small reply.
+            let _ = client.set_nodelay(true);
+
+            if verbose {
+                println!("\n{peer} connected");
+            }
+            match serve(client, &broker, &info, verbose) {
+                Ok(()) => {
+                    if verbose {
+                        println!("{peer} disconnected");
+                    }
+                }
+                Err(e) => println!("{peer} dropped: {e}"),
+            }
+        });
     }
 
     Ok(())
 }
 
-/// `--topic NAME:PARTITIONS`, repeatable. An unrecognised argument is an
-/// error rather than ignored: a typo that silently creates no topics looks
-/// exactly like a broker bug from the client side.
-fn parse_args() -> Result<Topics, String> {
-    let mut specs = Vec::new();
-    let mut args = std::env::args().skip(1);
+struct BrokerInfoOwned {
+    host: String,
+    port: i32,
+}
 
+const USAGE: &str = "\
+usage: franz [options]
+  --topic NAME:PARTITIONS   create a topic at startup, repeatable
+  --data-dir PATH           where logs live (default ./data)
+  --host HOST               address to listen on and advertise (default 127.0.0.1)
+  --port PORT               default 9092
+  --fsync always|never|MS   durability policy (default never)
+  --segment-bytes N         roll a segment past this size (default 64 MiB)
+  --index-interval N        one index entry per N bytes of log (default 4096)
+  --verbose                 print every frame";
+
+fn parse_args() -> Result<Settings, String> {
+    let mut specs = Vec::new();
+    let mut host = "127.0.0.1".to_string();
+    let mut port: u16 = 9092;
+    let mut data_dir = PathBuf::from("data");
+    let mut verbose = false;
+    let mut cfg = log::Config::default();
+
+    let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
+        let mut value = || args.next().ok_or(format!("{arg} needs a value"));
         match arg.as_str() {
-            "--topic" => {
-                let spec = args.next().ok_or("--topic needs NAME:PARTITIONS")?;
-                specs.push(spec);
+            "--topic" => specs.push(value()?),
+            "--data-dir" => data_dir = PathBuf::from(value()?),
+            "--host" => host = value()?,
+            "--port" => port = parse(&value()?, "port")?,
+            "--segment-bytes" => cfg.segment_bytes = parse(&value()?, "segment-bytes")?,
+            "--index-interval" => cfg.index_interval_bytes = parse(&value()?, "index-interval")?,
+            "--fsync" => {
+                let raw = value()?;
+                cfg.sync = match raw.as_str() {
+                    "always" => log::Sync::Always,
+                    "never" => log::Sync::Never,
+                    ms => log::Sync::Interval(Duration::from_millis(parse(ms, "fsync")?)),
+                };
+            }
+            "--verbose" => verbose = true,
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                std::process::exit(0);
             }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
 
-    Topics::from_specs(&specs)
+    Ok(Settings {
+        host,
+        port,
+        data_dir,
+        verbose,
+        topics: Topics::from_specs(&specs)?,
+        log: cfg,
+    })
 }
 
-/// Reads frames until the client goes away.
-fn serve(mut client: TcpStream, topics: &Topics) -> std::io::Result<()> {
+fn parse<T: std::str::FromStr>(raw: &str, what: &str) -> Result<T, String> {
+    raw.parse()
+        .map_err(|_| format!("`{raw}` is not a valid {what}"))
+}
+
+fn describe_sync(sync: log::Sync) -> String {
+    match sync {
+        log::Sync::Always => "every write (survives power loss)".to_string(),
+        log::Sync::Never => "never (survives a process crash, not power loss)".to_string(),
+        log::Sync::Interval(every) => {
+            format!(
+                "every {}ms (loses up to that on power loss)",
+                every.as_millis()
+            )
+        }
+    }
+}
+
+/// Reads frames until the client goes away. One request at a time: clients
+/// pipeline and expect replies in the order they asked.
+fn serve(
+    mut client: TcpStream,
+    broker: &Broker,
+    info: &BrokerInfoOwned,
+    verbose: bool,
+) -> std::io::Result<()> {
+    let mut frame = Vec::new();
+
     loop {
         let mut prefix = [0u8; 4];
         match client.read_exact(&mut prefix) {
@@ -79,50 +216,72 @@ fn serve(mut client: TcpStream, topics: &Topics) -> std::io::Result<()> {
             Err(e) => return Err(e),
         }
 
-        let len = u32::from_be_bytes(prefix) as usize;
-        let mut frame = vec![0u8; len];
+        let len = u32::from_be_bytes(prefix);
+        if len == 0 || len > MAX_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("length prefix of {len} is not a request"),
+            ));
+        }
+
+        frame.clear();
+        frame.resize(len as usize, 0);
         client.read_exact(&mut frame)?;
 
-        println!("\nframe of {len} bytes:");
-        hexdump(&frame);
+        if verbose {
+            println!("\nframe of {len} bytes:");
+            hexdump(&frame);
+        }
 
-        let Some(body) = respond(&frame, topics) else {
-            println!("  nothing to say, closing");
-            return Ok(());
-        };
-
-        println!("  replying with {} bytes:", body.len());
-        hexdump(&body);
-        client.write_all(&(body.len() as u32).to_be_bytes())?;
-        client.write_all(&body)?;
-        client.flush()?;
+        match respond(&frame, broker, info, verbose) {
+            Reply::Send(body) => {
+                if verbose {
+                    println!("  replying with {} bytes", body.len());
+                }
+                client.write_all(&(body.len() as u32).to_be_bytes())?;
+                client.write_all(&body)?;
+                client.flush()?;
+            }
+            Reply::Silent => {}
+            Reply::Close => {
+                if verbose {
+                    println!("  nothing to say, closing");
+                }
+                return Ok(());
+            }
+        }
     }
 }
 
-/// Builds the response body for one request, or `None` when there is nothing
-/// safe to say and the connection should be dropped.
-///
-/// Once decoding has failed there is no response shape left to guess at, and a
-/// client that keeps writing into a desynchronised connection only corrupts
-/// requests that would otherwise have been fine.
-fn respond(frame: &[u8], topics: &Topics) -> Option<Vec<u8>> {
+fn respond(frame: &[u8], broker: &Broker, info: &BrokerInfoOwned, verbose: bool) -> Reply {
     let mut r = Reader::new(frame);
     let header = match RequestHeader::decode(&mut r) {
         Ok(header) => header,
         Err(e) => {
-            println!("  unparseable: {e}");
-            return None;
+            println!("  unparseable request: {e}");
+            return Reply::Close;
         }
     };
 
-    println!(
-        "  {} v{} from {}, correlation_id {}, {} bytes of body",
-        header.api_key.name(),
-        header.api_version,
-        header.client_id.as_deref().unwrap_or("(no client_id)"),
-        header.correlation_id,
-        r.remaining(),
-    );
+    if verbose {
+        println!(
+            "  {} v{} from {}, correlation_id {}",
+            header.api_key.name(),
+            header.api_version,
+            header.client_id.as_deref().unwrap_or("(none)"),
+            header.correlation_id,
+        );
+    }
+
+    let unsupported = !header.api_key.supports(header.api_version);
+    if unsupported && header.api_key != ApiKey::ApiVersions {
+        println!(
+            "  {} v{} is outside what we advertised",
+            header.api_key.name(),
+            header.api_version
+        );
+        return Reply::Close;
+    }
 
     let mut w = Writer::new();
     write_response_header(
@@ -131,55 +290,79 @@ fn respond(frame: &[u8], topics: &Topics) -> Option<Vec<u8>> {
         header.api_version,
         header.correlation_id,
     );
+    let version = header.api_version;
 
     match header.api_key {
-        ApiKey::ApiVersions if !header.api_key.supports(header.api_version) => {
-            println!(
-                "  v{} is past what we speak, telling it to retry",
-                header.api_version
-            );
-            api_versions::write_unsupported(&mut w);
+        ApiKey::ApiVersions if unsupported => api_versions::write_unsupported(&mut w),
+        ApiKey::ApiVersions => {
+            api_versions::write_response(&mut w, version, codes::NONE, &api_versions::advertised())
         }
-        ApiKey::ApiVersions => api_versions::write_response(
-            &mut w,
-            header.api_version,
-            codes::NONE,
-            &api_versions::advertised(),
-        ),
-        ApiKey::Metadata => {
-            let request = match metadata::Request::decode(&mut r, header.api_version) {
-                Ok(request) => request,
-                Err(e) => {
-                    println!("  bad Metadata body: {e}");
-                    return None;
-                }
-            };
-            match &request.topics {
-                None => println!("  asked about every topic"),
-                Some(names) => println!("  asked about {names:?}"),
-            }
 
-            let broker = BrokerInfo {
+        ApiKey::Metadata => {
+            let request = match metadata::Request::decode(&mut r, version) {
+                Ok(request) => request,
+                Err(e) => return bad_body("Metadata", e),
+            };
+            let broker_info = BrokerInfo {
                 node_id: NODE_ID,
-                host: HOST,
-                port: PORT as i32,
+                host: &info.host,
+                port: info.port,
                 cluster_id: CLUSTER_ID,
             };
             metadata::write_response(
                 &mut w,
-                header.api_version,
-                &broker,
-                topics,
+                version,
+                &broker_info,
+                &broker.topics,
                 request.topics.as_deref(),
             );
         }
-        other => {
-            println!("  {} has no handler yet", other.name());
-            return None;
+
+        ApiKey::Produce => {
+            let mut request = match produce::Request::decode(&mut r, version) {
+                Ok(request) => request,
+                Err(e) => return bad_body("Produce", e),
+            };
+            if verbose {
+                println!(
+                    "  {} records, acks={}",
+                    produce::record_count(&request),
+                    request.acks
+                );
+            }
+            let acks = request.acks;
+            let results = produce::apply(broker, &mut request);
+            if acks == 0 {
+                return Reply::Silent;
+            }
+            produce::write_response(&mut w, version, &results);
+        }
+
+        ApiKey::Fetch => {
+            let request = match fetch::Request::decode(&mut r, version) {
+                Ok(request) => request,
+                Err(e) => return bad_body("Fetch", e),
+            };
+            let results = fetch::apply(broker, &request);
+            fetch::write_response(&mut w, version, &results);
+        }
+
+        ApiKey::ListOffsets => {
+            let request = match list_offsets::Request::decode(&mut r, version) {
+                Ok(request) => request,
+                Err(e) => return bad_body("ListOffsets", e),
+            };
+            let results = list_offsets::apply(broker, &request);
+            list_offsets::write_response(&mut w, version, &results);
         }
     }
 
-    Some(w.into_inner())
+    Reply::Send(w.into_inner())
+}
+
+fn bad_body(api: &str, e: protocol::Error) -> Reply {
+    println!("  bad {api} body: {e}");
+    Reply::Close
 }
 
 fn hexdump(bytes: &[u8]) {

@@ -124,9 +124,15 @@ mod tests {
     }
 
     #[test]
-    fn we_advertise_exactly_what_we_implement() {
+    fn we_advertise_every_api_we_implement_and_nothing_else() {
         let keys: Vec<i16> = advertised().iter().map(|r| r.api_key).collect();
-        assert_eq!(keys, [ApiKey::Metadata as i16, ApiKey::ApiVersions as i16]);
-        assert!(!ApiKey::Produce.supports(0), "Produce is not built yet");
+        assert_eq!(keys, [0, 1, 2, 3, 18], "ascending api_key order");
+
+        // Produce, Fetch and ListOffsets deliberately stop below the version
+        // where each turns flexible.
+        assert!(!ApiKey::Produce.supports(9));
+        assert!(!ApiKey::Fetch.supports(12));
+        assert!(!ApiKey::ListOffsets.supports(6));
+        assert!(ApiKey::Produce.supports(8));
     }
 }
